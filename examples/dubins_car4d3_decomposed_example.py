@@ -140,6 +140,24 @@ def solve_vy(c, tau):
     )   # shape (ny, nv, nth, T)
 
 
+def compute_close_value_gap(v_vx_all, v_vy_all):
+    """Compute per-grid-point gap |Vx_4D - Vy_4D| at every time step.
+
+    Used by DeepReach as an adaptive guidance weight: larger gap → stronger
+    training pressure to match the decomposition approximation v_hat.
+
+    Args:
+        v_vx_all : (nx, nv, nth, T) — Vx subsystem BRS
+        v_vy_all : (ny, nv, nth, T) — Vy subsystem BRS
+
+    Returns:
+        (nx, ny, nv, nth, T) float32 — |Vx - Vy| at each 4D grid point
+    """
+    vx_4d = v_vx_all[:, np.newaxis, :, :, :]   # (nx,  1, nv, nth, T)
+    vy_4d = v_vy_all[np.newaxis, :, :, :, :]   # ( 1, ny, nv, nth, T)
+    return np.abs(vx_4d - vy_4d).astype(np.float32)   # (nx, ny, nv, nth, T)
+
+
 def reconstruct_brt_4d(v_vx_all, v_vy_all):
     """Reconstruct full 4D BRT at every time step from subsystem BRS arrays
     (Proposition 4, Chen et al. 2018).
@@ -221,16 +239,25 @@ def main(out_dir: str):
     print(f"  shape : {v_brt.shape}   time : {t_recon:.1f}s")
     print(f"  BRT volume at final step (V<0): {(v_brt[..., 0] < 0).mean():.3f}")
 
+    # ── Compute decomposition gap ─────────────────────────────────────────
+    print("Computing close_value_gap_all  |Vx_4D - Vy_4D| ...")
+    t0 = time.time()
+    close_value_gap_all = compute_close_value_gap(v_vx_all, v_vy_all)
+    t_gap = time.time() - t0
+    print(f"  shape : {close_value_gap_all.shape}   time : {t_gap:.1f}s")
+    print(f"  gap  mean={close_value_gap_all.mean():.4f}  max={close_value_gap_all.max():.4f}")
+
     # ── Save ──────────────────────────────────────────────────────────────
     saves = {
-        "v_vx_brs.npy": v_vx_all,
-        "v_vy_brs.npy": v_vy_all,
-        "v_brt.npy":    v_brt,
+        "v_vx_brs.npy":            v_vx_all,
+        "v_vy_brs.npy":            v_vy_all,
+        "v_brt.npy":               v_brt,
+        "close_value_gap_all.npy": close_value_gap_all,
     }
     for fname, arr in saves.items():
         p = os.path.join(out_dir, fname)
         np.save(p, arr)
-        print(f"Saved {fname:20s} shape={arr.shape}  → {p}")
+        print(f"Saved {fname:25s} shape={arr.shape}  → {p}")
 
     # ── Manifest ──────────────────────────────────────────────────────────
     manifest = {
@@ -254,6 +281,12 @@ def main(out_dir: str):
                 "axes": ["x", "y", "v", "theta", "time"],
                 "note": "full 4D BRT at every time step; index 0 = full BRT, index -1 = target set",
             },
+            "close_value_gap_all": {
+                "path": "close_value_gap_all.npy",
+                "shape": list(close_value_gap_all.shape),
+                "axes": ["x", "y", "v", "theta", "time"],
+                "note": "|Vx_4D - Vy_4D|; used as adaptive guidance weight in DeepReach training",
+            },
         },
         "reconstruction": {
             "method": "Proposition 4, Chen et al. 2018",
@@ -264,6 +297,7 @@ def main(out_dir: str):
             "vx_seconds":    round(t_vx,    2),
             "vy_seconds":    round(t_vy,    2),
             "recon_seconds": round(t_recon, 2),
+            "gap_seconds":   round(t_gap,   2),
         },
     }
     manifest_path = os.path.join(out_dir, "artifact_manifest.json")
@@ -278,6 +312,50 @@ def main(out_dir: str):
     print(f"Saved metrics.json           → {metrics_path}")
 
 
+def main_gap_only(out_dir: str):
+    """Load already-computed subsystem arrays and produce close_value_gap_all.npy.
+
+    Use this instead of main() when v_vx_brs.npy and v_vy_brs.npy already exist
+    in out_dir and you only need to (re-)generate close_value_gap_all.npy.
+    Updates artifact_manifest.json in-place if it exists.
+    """
+    vx_path = os.path.join(out_dir, "v_vx_brs.npy")
+    vy_path = os.path.join(out_dir, "v_vy_brs.npy")
+    print(f"Loading  {vx_path}")
+    v_vx_all = np.load(vx_path)
+    print(f"Loading  {vy_path}")
+    v_vy_all = np.load(vy_path)
+    print(f"  v_vx_brs shape : {v_vx_all.shape}")
+    print(f"  v_vy_brs shape : {v_vy_all.shape}")
+
+    print("Computing close_value_gap_all  |Vx_4D - Vy_4D| ...")
+    t0 = time.time()
+    close_value_gap_all = compute_close_value_gap(v_vx_all, v_vy_all)
+    t_gap = time.time() - t0
+    print(f"  shape : {close_value_gap_all.shape}   time : {t_gap:.1f}s")
+    print(f"  gap  mean={close_value_gap_all.mean():.4f}  max={close_value_gap_all.max():.4f}")
+
+    gap_path = os.path.join(out_dir, "close_value_gap_all.npy")
+    np.save(gap_path, close_value_gap_all)
+    print(f"Saved close_value_gap_all.npy  shape={close_value_gap_all.shape}  → {gap_path}")
+
+    # Patch manifest if it exists
+    manifest_path = os.path.join(out_dir, "artifact_manifest.json")
+    if os.path.exists(manifest_path):
+        with open(manifest_path) as f:
+            manifest = json.load(f)
+        manifest.setdefault("values", {})["close_value_gap_all"] = {
+            "path": "close_value_gap_all.npy",
+            "shape": list(close_value_gap_all.shape),
+            "axes": ["x", "y", "v", "theta", "time"],
+            "note": "|Vx_4D - Vy_4D|; used as adaptive guidance weight in DeepReach training",
+        }
+        manifest.setdefault("timing", {})["gap_seconds"] = round(t_gap, 2)
+        with open(manifest_path, "w") as f:
+            json.dump(manifest, f, indent=2)
+        print(f"Updated artifact_manifest.json → {manifest_path}")
+
+
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run decomposed DubinsCar4D3 BRT solver (Vx + Vy subsystems)"
@@ -288,4 +366,11 @@ if __name__ == "__main__":
         help="Directory to write outputs (default: ./output_DubinsCar4D3_decomposed)",
     )
     args = parser.parse_args()
+
+    # Full solve (default): runs both subsystems, reconstructs BRT, computes gap.
     main(args.out_dir)
+
+    # Gap-only: use when v_vx_brs.npy / v_vy_brs.npy already exist and you only
+    # need to (re-)generate close_value_gap_all.npy.  Uncomment and comment out
+    # main() above to use.
+    # main_gap_only(args.out_dir)
