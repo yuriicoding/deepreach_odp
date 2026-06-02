@@ -44,7 +44,7 @@ BRS of the Vx subsystem `[x, v, θ]` saved at every time step.
 No running-minimum clamping is applied, so each time slice is the pure BRS at exactly that
 backward time (not a cumulative tube).
 
-### `v_vy_brs.npy` — shape `(ny, nv, nth, T)`
+### `v_vy_brs.npy` — shape `(ny, nv, nth, T)` aka v_hat_all.npy
 
 BRS of the Vy subsystem `[y, v, θ]` saved at every time step. Same conventions as above.
 
