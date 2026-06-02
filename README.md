@@ -1,3 +1,154 @@
+# DubinsCar4D3 Decomposed BRT — Usage Guide
+
+This section documents the decomposed 3D subsystem classes for the 4D bicycle-model Dubins car
+(`DubinsCar4D3`) and the example script that computes the full 4D Backward Reachable Tube (BRT)
+via system decomposition.
+
+## Background
+
+`DubinsCar4D3` has state `[x, y, v, θ]` and control `[a, δ]` (acceleration, steering angle).
+Computing its BRT directly in 4D is expensive. Using the decomposition method from
+*"Decomposition of Reachable Sets and Tubes for a Class of Nonlinear Systems"* (Chen et al. 2018),
+the 4D system is split into two 3D subsystems that share the common states `(v, θ)`:
+
+| Class | File | State | Position axis dropped |
+|---|---|---|---|
+| `DubinsCar4D3Vx` | `odp/dynamics/DubinsCar4D3Vx.py` | `[x, v, θ]` | y |
+| `DubinsCar4D3Vy` | `odp/dynamics/DubinsCar4D3Vy.py` | `[y, v, θ]` | x |
+
+Each subsystem is a self-contained 3D HJ problem. The full 4D BRT is reconstructed from their
+outputs with no additional approximation error (Proposition 4, Theorem 2 of the paper).
+
+## Running the decomposed BRT example
+
+```bash
+cd /path/to/optimized_dp
+python examples/dubins_car4d3_decomposed_example.py
+# or specify a custom output directory:
+python examples/dubins_car4d3_decomposed_example.py --out_dir my_output/
+```
+
+This runs two 3D solves (Vx then Vy) and reconstructs the full 4D BRT.
+
+## Output files
+
+All files are written to `output_DubinsCar4D3_decomposed/` (or the directory given by `--out_dir`).
+
+### `v_vx_brs.npy` — shape `(nx, nv, nth, T)`
+
+BRS of the Vx subsystem `[x, v, θ]` saved at every time step.
+- Axis order: `[x, v, θ, time]`
+- `[..., -1]` = initial target set (t = 0)
+- `[..., 0]`  = BRS at the full lookback time
+
+No running-minimum clamping is applied, so each time slice is the pure BRS at exactly that
+backward time (not a cumulative tube).
+
+### `v_vy_brs.npy` — shape `(ny, nv, nth, T)`
+
+BRS of the Vy subsystem `[y, v, θ]` saved at every time step. Same conventions as above.
+
+### `v_brt.npy` — shape `(nx, ny, nv, nth, T)`
+
+Full reconstructed 4D BRT at every time step. Axis order: `[x, y, v, θ, time]`.
+- `[..., 0]`  = full BRT at t = lookback\_length (the final result you typically use)
+- `[..., -1]` = BRT at t = 0 (equals the initial target set)
+- `[..., i]`  = BRT accumulated up to backward time step i
+
+Matches the shape and axis convention of `v_direct_all.npy` produced by
+`dubins_car4d3_example.py`, so slices can be compared directly:
+
+```python
+import numpy as np
+v_direct = np.load("output_DubinsCar4D3/v_direct_all.npy")    # (60,60,20,36,31)
+v_decomp  = np.load("output_DubinsCar4D3_decomposed/v_brt.npy")  # (60,60,20,36,31)
+print("Max abs difference:", np.abs(v_direct - v_decomp).max())
+# Expected: near zero (only floating-point noise from independent grid numerics)
+```
+
+### `artifact_manifest.json`
+
+JSON file recording the shape, axis order, and reconstruction formula for each saved array.
+
+### `metrics.json`
+
+JSON file recording the full solver configuration (grid bounds, resolution, control limits,
+target box, time horizon) and a pointer to `artifact_manifest.json`.
+
+## How the reconstruction works
+
+The full BRT cannot be obtained by simply intersecting the two subsystem BRTs — the paper
+(Table II) shows this is invalid for an intersection target with shared controls, because
+timing information is lost.
+
+The correct method (Proposition 4) is:
+
+1. **For each time step s**, compute the 4D BRS by back-projecting and intersecting the
+   subsystem BRSs at that same time:
+   ```
+   BRS_full(s) = max(BRS_Vx_4D(s), BRS_Vy_4D(s))   ← intersection in level-set
+   ```
+2. **Union over all time steps** to form the BRT:
+   ```
+   BRT_full = min over all s of BRS_full(s)           ← union in level-set
+   ```
+
+In NumPy this is a running minimum over the time axis, implemented in `reconstruct_brt_4d()`
+inside the example script.
+
+## Running the direct 4D example (baseline)
+
+```bash
+cd /path/to/optimized_dp
+python examples/dubins_car4d3_example.py
+# or specify a custom output directory:
+python examples/dubins_car4d3_example.py --out_dir my_output/
+```
+
+This solves the BRT for the full `DubinsCar4D3` system directly in 4D without any decomposition.
+It is slower than the decomposed approach but serves as the ground-truth result to compare against.
+
+### Output files
+
+All files are written to `output_DubinsCar4D3/` (or the directory given by `--out_dir`).
+
+#### `v_direct_all.npy` — shape `(nx, ny, nv, nth, T)`
+
+Value function saved at every time step. Axis order: `[x, y, v, θ, time]`.
+- `[..., 0]`  = full BRT at t = lookback\_length
+- `[..., -1]` = initial target set (t = 0)
+
+#### `v_direct_final.npy` — shape `(nx, ny, nv, nth)`
+
+Value function at the final time step only — equivalent to `v_direct_all[..., 0]`.
+Cells where the value is negative are inside the BRT (the car will enter the obstacle box
+within the time horizon under worst-case control).
+
+#### `artifact_manifest.json` / `metrics.json`
+
+Same format as the decomposed example — shape metadata and full solver configuration.
+
+### Comparing direct vs decomposed
+
+```python
+import numpy as np
+v_direct = np.load("output_DubinsCar4D3/v_direct_all.npy")       # (60,60,20,36,31)
+v_decomp  = np.load("output_DubinsCar4D3_decomposed/v_brt.npy")  # (60,60,20,36,31)
+print("Max abs difference:", np.abs(v_direct - v_decomp).max())
+# Expected: near zero — decomposition introduces no additional approximation error
+```
+
+---
+
+
+
+
+
+
+
+
+
+
 # Optimized Dynamic Programming-Based Algorithms Solver (OptimizedDP)
 The repo contains implementation of dynamic programming based algorithms in optimal control. Specifically, the solver supports 3 main classes of algorithms: level set based algorithm for solving Hamilton-Jacobi-Issac (HJI) partial differential equation (PDE) arising in reachability analysis and differential games [1], time-to-reach (TTR) computations of dynamical systems in reachability analysis [2], and value-iterations algorithm for solving continuous state-space action-space Markov Decision Process (MDP). All these algorithms share the property of being implemented on a multidimensional grid and hence, their computational complexities increase exponentially as a function of dimension. For all the aforementioned algorithms, our toolbox allows computation up to 6 dimensions, which we think is the limit of dynammic programming on most modern personal computers.
 <div align="center">
