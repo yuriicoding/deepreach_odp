@@ -26,7 +26,7 @@ be compared directly.
 Output (written to --out_dir, default ./output_DubinsCar4D3_decomposed/):
   v_vx_brs.npy   — Vx subsystem BRS at all time steps, shape (nx, nv, nth, T)
   v_vy_brs.npy   — Vy subsystem BRS at all time steps, shape (ny, nv, nth, T)
-  v_brt.npy      — reconstructed full 4D BRT,           shape (nx, ny, nv, nth)
+  v_hat_all.npy      — reconstructed full 4D BRT,           shape (nx, ny, nv, nth)
 """
 
 import argparse
@@ -155,7 +155,7 @@ def compute_close_value_gap(v_vx_all, v_vy_all):
     """
     vx_4d = v_vx_all[:, np.newaxis, :, :, :]   # (nx,  1, nv, nth, T)
     vy_4d = v_vy_all[np.newaxis, :, :, :, :]   # ( 1, ny, nv, nth, T)
-    return np.abs(vx_4d - vy_4d).astype(np.float32)   # (nx, ny, nv, nth, T)
+    return np.abs(vx_4d - vy_4d)  # (nx, ny, nv, nth, T)
 
 
 def reconstruct_brt_4d(v_vx_all, v_vy_all):
@@ -251,7 +251,7 @@ def main(out_dir: str):
     saves = {
         "v_vx_brs.npy":            v_vx_all,
         "v_vy_brs.npy":            v_vy_all,
-        "v_brt.npy":               v_brt,
+        "v_hat_all.npy":               v_brt,
         "close_value_gap_all.npy": close_value_gap_all,
     }
     for fname, arr in saves.items():
@@ -275,8 +275,8 @@ def main(out_dir: str):
                 "axes": ["y", "v", "theta", "time"],
                 "note": "pure BRS at each time step (no running-min clamping)",
             },
-            "v_brt": {
-                "path": "v_brt.npy",
+            "v_hat_all": {
+                "path": "v_hat_all.npy",
                 "shape": list(v_brt.shape),
                 "axes": ["x", "y", "v", "theta", "time"],
                 "note": "full 4D BRT at every time step; index 0 = full BRT, index -1 = target set",
@@ -368,9 +368,9 @@ if __name__ == "__main__":
     args = parser.parse_args()
 
     # Full solve (default): runs both subsystems, reconstructs BRT, computes gap.
-    main(args.out_dir)
+    # main(args.out_dir)
 
     # Gap-only: use when v_vx_brs.npy / v_vy_brs.npy already exist and you only
     # need to (re-)generate close_value_gap_all.npy.  Uncomment and comment out
     # main() above to use.
-    # main_gap_only(args.out_dir)
+    main_gap_only(args.out_dir)
