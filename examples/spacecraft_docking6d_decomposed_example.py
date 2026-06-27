@@ -89,12 +89,34 @@ CFG = {
     "Fy_min": -20.0, "Fy_max": 20.0,    # [N]
     "tau_min": -1.5, "tau_max":  1.5,   # [N*m]
 
-    # goal tolerances (paper values)
+    # goal tolerances (paper values — used in DeepReach reach_fn with tanh scaling)
     "eps_p":  0.1,           # position  [m]
     "eps_v":  0.1,           # velocity  [m/s]
     "eps_th": 0.04,          # attitude  [rad]
     "eps_w":  0.05,          # angular rate  [rad/s]
     "theta_goal": math.pi / 2,
+
+    # ODP-specific goal sizes — relaxed so that several grid points fall inside
+    # the goal at t=0.  ODP's grid-based PDE needs the initial value function to
+    # be negative somewhere; if the goal is smaller than the grid spacing it never
+    # is.  Rule of thumb: goal radius ≥ 1–2 × grid spacing.
+    #
+    # DubinsCar4D3 worked because box_radius=0.8 m on a 0.1 m grid (8 cells).
+    # Here the grid spacings are:
+    #   px/py : 30 m / 9 gaps = 3.33 m  →  odp_px_radius = 3.5 m  (~1 cell)
+    #   vx    :  3 m/s / 7 gaps = 0.43 m/s  →  odp_vxy_radius = 0.5 m/s (~1 cell)
+    #   vy    :  4 m/s / 7 gaps = 0.57 m/s  →  same
+    #   theta : 2π / 11 gaps = 0.57 rad  →  odp_th_radius = 0.8 rad  (~1-2 cells)
+    #   omega :  4 / 7 gaps = 0.57 rad/s  →  odp_om_radius = 0.6 rad/s (~1 cell)
+    #
+    # The py goal band is widened to [-5, -0.5] (4.5 m, ~1-2 cells) to ensure
+    # grid points fall below the inflated obstacle at py ≈ -0.9 m.
+    "odp_px_radius":  3.5,    # [m]      replaces eps_p for ODP
+    "odp_py_min":    -5.0,    # [m]      wide approach corridor below obstacle
+    "odp_py_max":    -0.5,    # [m]
+    "odp_vxy_radius": 0.5,    # [m/s]   replaces eps_v for ODP
+    "odp_th_radius":  0.8,    # [rad]   replaces eps_th for ODP
+    "odp_om_radius":  0.6,    # [rad/s] replaces eps_w for ODP
 
     # chaser bounding-circle radius (paper: rc ≈ 0.707 m)
     "rc": 0.707,
@@ -107,8 +129,7 @@ CFG = {
     "post_hw_x":   0.6,
     "post_length": 0.2,
 
-    # goal band (derived from paper geometry):
-    #   just below inflated post, py ∈ [goal_y_min, goal_y_max]
+    # goal band (paper geometry, kept for reference — not used in ODP level-sets)
     "goal_y_max": -(0.2 + 0.707 + 0.093),       # ≈ -1.0 m
     "goal_y_min": -(0.2 + 0.707 + 0.093) - 0.4, # ≈ -1.4 m
 
@@ -127,28 +148,24 @@ CFG = {
 def trans_reach_fn(g, c):
     """Translation reach set level-function on 4D grid [px, py, vx, vy].
 
-    g(z_trans) ≤ 0  iff  |px| ≤ eps_p  AND  py ∈ [goal_y_min, goal_y_max]
-                          AND  ||[vx,vy]|| ≤ eps_v
+    Uses ODP-specific goal sizes (odp_*) — relaxed from paper tolerances so
+    that multiple grid cells fall inside the goal at t=0.
 
-    Uses the max-of-signed-distances convention (level ≤ 0 → in set).
+    g(z_trans) ≤ 0  iff  |px| ≤ odp_px_radius
+                          AND  py ∈ [odp_py_min, odp_py_max]
+                          AND  ||[vx,vy]|| ≤ odp_vxy_radius
     """
     px = g.vs[0]   # (npx,  1,   1,   1)
     py = g.vs[1]   # ( 1,  npy,  1,   1)
     vx = g.vs[2]   # ( 1,   1,  nvx,  1)
     vy = g.vs[3]   # ( 1,   1,   1,  nvy)
 
-    # Lateral position band: |px| ≤ eps_p
-    px_dist = np.abs(px) - c["eps_p"]
+    px_dist  = np.abs(px) - c["odp_px_radius"]
+    py_dist  = np.maximum(c["odp_py_min"] - py, py - c["odp_py_max"])
+    pos_dist = np.maximum(px_dist, py_dist)
 
-    # Longitudinal goal band: py ∈ [goal_y_min, goal_y_max]
-    py_dist = np.maximum(c["goal_y_min"] - py, py - c["goal_y_max"])
+    vel_dist = np.sqrt(vx**2 + vy**2) - c["odp_vxy_radius"]
 
-    pos_dist = np.maximum(px_dist, py_dist)     # (npx, npy, 1, 1) via broadcast
-
-    # Velocity: L2 norm ≤ eps_v
-    vel_dist = np.sqrt(vx**2 + vy**2) - c["eps_v"]   # (1, 1, nvx, nvy)
-
-    # Reach: must satisfy BOTH position AND velocity
     return np.broadcast_to(
         np.maximum(pos_dist, vel_dist),
         tuple(g.pts_each_dim),
@@ -191,21 +208,22 @@ def avoid_fn(g, c):
 def rot_reach_fn(g, c):
     """Rotation reach set level-function on 2D grid [theta, omega].
 
-    h(z_rot) ≤ 0  iff  |theta - theta_goal| ≤ eps_th  AND  |omega| ≤ eps_w
+    Uses ODP-specific goal sizes (odp_*) — relaxed from paper tolerances.
+
+    h(z_rot) ≤ 0  iff  |theta - theta_goal| ≤ odp_th_radius
+                        AND  |omega| ≤ odp_om_radius
     """
     theta = g.vs[0]   # (nth, 1)
     omega = g.vs[1]   # ( 1, nom)
 
-    # Wrapped angle error to theta_goal = pi/2
-    theta_err = np.abs(
+    theta_err  = np.abs(
         np.arctan2(
             np.sin(theta - c["theta_goal"]),
             np.cos(theta - c["theta_goal"]),
         )
     )
-    theta_dist = theta_err - c["eps_th"]
-
-    omega_dist = np.abs(omega) - c["eps_w"]
+    theta_dist = theta_err - c["odp_th_radius"]
+    omega_dist = np.abs(omega) - c["odp_om_radius"]
 
     return np.broadcast_to(
         np.maximum(theta_dist, omega_dist),
