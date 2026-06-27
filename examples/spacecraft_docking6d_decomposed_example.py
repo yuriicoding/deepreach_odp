@@ -67,7 +67,7 @@ CFG = {
     # Grid resolution is kept coarse so the 6D output arrays fit in memory:
     #   v_brat and close_value_gap_all each have shape
     #   (npx, npy, nvx, nvy, nth, nom, T).
-    #   At float32: 10*10*8*8*12*8*101 * 4 bytes ≈ 248 MB per array.
+    #   At float32: 10*10*8*8*24*16*101 * 4 bytes ≈ 994 MB per array.
     "px_min": -15.0, "px_max": 15.0,
     "py_min": -15.0, "py_max": 15.0,
     "vx_min":  -1.5, "vx_max":  1.5,
@@ -75,9 +75,12 @@ CFG = {
     "npx": 10, "npy": 10, "nvx": 8, "nvy": 8,
 
     # rotation grid  [theta (rad), omega (rad/s)]
+    # nth=24 → theta spacing ≈ 0.26 rad (odp_th_radius=0.8 spans ~6 cells)
+    # nom=16 → omega spacing ≈ 0.27 rad/s (odp_om_radius=0.6 spans ~4 cells)
+    # 6D array memory: 10*10*8*8*24*16*101*4 bytes ≈ 994 MB per array
     "th_min": -math.pi, "th_max": math.pi,
     "om_min":  -2.0,    "om_max":  2.0,
-    "nth": 12, "nom": 8,
+    "nth": 24, "nom": 16,
 
     # spacecraft parameters (paper values)
     "n": 0.001131,       # orbital mean motion [rad/s], ~400 km LEO
