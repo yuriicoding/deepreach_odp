@@ -7,6 +7,9 @@ except ImportError:
     hcl = None
     HCL_AVAILABLE = False
 
+# Default inertia — matches Docking2D.py: 1/12 * mc * (w_c^2 + h_c^2) with mc=200, w_c=h_c=1
+_I_DEFAULT = 200.0 / 6.0  # ≈ 33.33 kg*m^2
+
 """
 2D ROTATIONAL SUBSYSTEM OF SpacecraftDocking6D
 (single-axis attitude dynamics)
@@ -39,7 +42,7 @@ class SpacecraftDocking6DRot:
         dMax=[0.0],
         uMode="min",
         dMode="max",
-        I=50.0,
+        I=_I_DEFAULT,
     ):
         """
         Args:

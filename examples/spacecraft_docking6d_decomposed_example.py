@@ -3,42 +3,33 @@ Example: Decomposed BRAT for SpacecraftDocking6D
 (Clohessy-Wiltshire translation + single-axis rotation)
 Reference: Thorup et al., arXiv:2605.02021, 2026.
 
-Goal: reach the docking port approach corridor with correct attitude while
-avoiding the target body (6×3 m) and docking post (both inflated by rc=0.707 m).
+Grid dimensions, goal/avoid sets, and all parameters match the paper's
+gridBased6DImplementation (Docking4D.py + Docking2D.py).
 
-Solves the BRAT/BRS at every time step independently for each subsystem:
+Solves the BRAT/BRS independently for each subsystem:
   - SpacecraftDocking6DTrans : state = [px, py, vx, vy]   (4D, CW dynamics)
       BRAT: must reach pos/vel goal while avoiding body + post obstacles.
   - SpacecraftDocking6DRot   : state = [theta, omega]     (2D, pure rotation)
       BRS: must reach attitude/rate goal; no obstacle in rotation state.
-
-Then reconstructs the full 6D BRAT at every time step:
-
-  BRAS_6D(s) = proj^{-1}(BRAS_trans(s)) ∩ proj^{-1}(BRS_rot(s))
-             = max( V_trans_6D(s), V_rot_6D(s) )   [intersection in level-set]
-
-  BRAT_6D    = union_{s} BRAS_6D(s)
-             = min_{s}   max(V_trans_6D(s), V_rot_6D(s))
 
 BRAT mechanics in ODP (solver.py):
   Pass  multiple_value = [reach_target, avoid_constraint]  to HJSolver.
   - init_value = max(reach_target, -avoid_constraint)      [boundary_fn]
   - compMethod["ObstacleSetMode"] = "maxVWithObstacle"
     → clamps V = max(V, -avoid_constraint) at every time step
-    → states inside the obstacle stay infeasible for all time
   - compMethod["TargetSetMode"]   = "none"
     → no running-min clamping; solver returns pure BRAS at each saved time step
 
 INDEPENDENCE NOTE:
   Translation [px, py, vx, vy] uses [Fx, Fy]; rotation [theta, omega] uses [tau].
-  No shared state or control → full 6D BRAT reconstruction is EXACT.
-  The obstacle only depends on (px, py) so it only enters the translation subsystem.
+  No shared state or control → full 6D BRAT reconstruction is EXACT (Prop 1 + Prop 4,
+  Chen et al. 2018). The reconstruct_brat_6d helper below is correct but infeasible
+  at paper resolution (full 6D array would be ~509 GB); evaluate V6D on demand as
+  max(interp(V_trans, x_trans, t), interp(V_rot, x_rot, t)).
 
 Output (written to --out_dir, default ./output_SpacecraftDocking6D_decomposed/):
-  v_trans_brs.npy         — translation BRAS at all time steps, (npx, npy, nvx, nvy, T)
-  v_rot_brs.npy           — rotation    BRS  at all time steps, (nth, nom, T)
-  v_brat.npy              — reconstructed full 6D BRAT,         (npx, npy, nvx, nvy, nth, nom, T)
-  close_value_gap_all.npy — |V_trans_6D - V_rot_6D|,            (npx, npy, nvx, nvy, nth, nom, T)
+  v_trans_brs.npy  — translation BRAS at all time steps, (npx, npy, nvx, nvy, T) ~2.5 GB
+  v_rot_brs.npy    — rotation    BRS  at all time steps, (nth, nom, T)             ~51 MB
 """
 
 import argparse
@@ -55,49 +46,68 @@ from odp.solver import HJSolver
 
 
 # ---------------------------------------------------------------------------
-# Configuration — matches Thorup et al., arXiv:2605.02021, 2026
+# Pre-computed constants — match Docking4D.py / Docking2D.py in paper code
+# ---------------------------------------------------------------------------
+_MU        = 3.986004418e14          # Earth gravitational parameter [m^3/s^2]
+_R_EARTH   = 6371e3                  # Earth mean radius [m]
+_ORBIT_ALT = 400e3                   # Orbital altitude [m]
+_N = math.sqrt(_MU / (_R_EARTH + _ORBIT_ALT) ** 3)   # mean motion ≈ 0.001133 rad/s
+
+_W_C = 1.0                           # chaser width  [m]
+_H_C = 1.0                           # chaser height [m]
+_RC  = math.sqrt(_W_C**2 + _H_C**2) / 2   # bounding-circle radius = sqrt(2)/2 ≈ 0.7071 m
+
+_POST_LENGTH      = 0.2              # docking post length [m]
+_GOAL_CLEARANCE   = -0.007           # goal top is 7 mm inside inflated post boundary [m]
+_GOAL_BAND_HEIGHT = 0.5              # goal band height [m]
+_GOAL_Y_MAX = -(_POST_LENGTH + _RC + _GOAL_CLEARANCE)   # ≈ -0.900 m
+_GOAL_Y_MIN = _GOAL_Y_MAX - _GOAL_BAND_HEIGHT           # = -1.400 m
+
+# ---------------------------------------------------------------------------
+# Configuration — matches Docking4D.py + Docking2D.py in paper code exactly
 # ---------------------------------------------------------------------------
 CFG = {
-    # time
+    # time — matches DeepReach training horizon
     "tmax": 10.0,
     "dt": 0.1,
     "small_number": 1e-5,
 
-    # translation grid  [px (m), py (m), vx (m/s), vy (m/s)]
-    # Grid resolution is kept coarse so the 6D output arrays fit in memory:
-    #   v_brat and close_value_gap_all each have shape
-    #   (npx, npy, nvx, nvy, nth, nom, T).
-    #   At float32: 10*10*8*8*12*8*101 * 4 bytes ≈ 248 MB per array.
+    # translation grid [px (m), py (m), vx (m/s), vy (m/s)]
+    # Matches Docking4D.py: grid_resolution = (51, 51, 31, 31)
+    #   state_domain px/py ∈ [-15, 15], vx/vy ∈ [-1.5, 1.5]
+    # v_trans_brs shape: 51×51×31×31×251 × 4 bytes ≈ 2.5 GB
     "px_min": -15.0, "px_max": 15.0,
     "py_min": -15.0, "py_max": 15.0,
     "vx_min":  -1.5, "vx_max":  1.5,
-    "vy_min":  -2.0, "vy_max":  2.0,
-    "npx": 10, "npy": 10, "nvx": 8, "nvy": 8,
+    "vy_min":  -1.5, "vy_max":  1.5,
+    "npx": 51, "npy": 51, "nvx": 31, "nvy": 31,
 
-    # rotation grid  [theta (rad), omega (rad/s)]
+    # rotation grid [theta (rad), omega (rad/s)]
+    # Matches Docking2D.py: grid_resolution = (361, 141)
+    #   state_domain theta ∈ [-π, π], omega ∈ [-2, 2]
     "th_min": -math.pi, "th_max": math.pi,
     "om_min":  -2.0,    "om_max":  2.0,
-    "nth": 12, "nom": 8,
+    "nth": 361, "nom": 141,
 
-    # spacecraft parameters (paper values)
-    "n": 0.001131,       # orbital mean motion [rad/s], ~400 km LEO
+    # spacecraft parameters — match paper code
+    "n": _N,             # mean motion [rad/s], computed from 400 km LEO
     "m": 200.0,          # chaser mass [kg]
-    "I": 200.0 / 6.0,   # moment of inertia [kg*m^2]
+    "I": 200.0 / 6.0,   # moment of inertia [kg*m^2] = 1/12 * m * (w_c^2 + h_c^2)
 
     # control bounds
     "Fx_min": -20.0, "Fx_max": 20.0,    # [N]
     "Fy_min": -20.0, "Fy_max": 20.0,    # [N]
     "tau_min": -1.5, "tau_max":  1.5,   # [N*m]
 
-    # goal tolerances (paper values)
+    # goal tolerances — match paper code
     "eps_p":  0.1,           # position  [m]
     "eps_v":  0.1,           # velocity  [m/s]
     "eps_th": 0.04,          # attitude  [rad]
     "eps_w":  0.05,          # angular rate  [rad/s]
     "theta_goal": math.pi / 2,
 
-    # chaser bounding-circle radius (paper: rc ≈ 0.707 m)
-    "rc": 0.707,
+    # chaser bounding-circle radius — matches Docking4D.py: sqrt(w_c^2+h_c^2)/2
+    "rc": _RC,
 
     # target body: 6×3 m rectangle, y ∈ [0, h_t], x ∈ [-w_t/2, w_t/2]
     "w_t": 6.0,
@@ -105,17 +115,16 @@ CFG = {
 
     # docking post: y ∈ [-post_length, 0], x ∈ [-post_hw_x, post_hw_x]
     "post_hw_x":   0.6,
-    "post_length": 0.2,
+    "post_length": _POST_LENGTH,
 
-    # goal band (derived from paper geometry):
-    #   just below inflated post, py ∈ [goal_y_min, goal_y_max]
-    "goal_y_max": -(0.2 + 0.707 + 0.093),       # ≈ -1.0 m
-    "goal_y_min": -(0.2 + 0.707 + 0.093) - 0.4, # ≈ -1.4 m
+    # goal band — matches Docking4D.py exactly
+    #   goal_y_max ≈ -0.900 m (7 mm inside inflated post; masked by avoid constraint)
+    #   goal_y_min = -1.400 m
+    "goal_y_max": _GOAL_Y_MAX,
+    "goal_y_min": _GOAL_Y_MIN,
 
-    # solver
+    # solver — "none" → no running-min clamping → pure BRAS per step (needed for decomp)
     "accuracy": "medium",
-    # "none" is unrecognised by solver post-processing → no running-min clamping
-    # → solver saves pure BRS/BRAS at each time step (correct for decomposition)
     "target_set_mode": "none",
 }
 
@@ -146,7 +155,7 @@ def trans_reach_fn(g, c):
     pos_dist = np.maximum(px_dist, py_dist)     # (npx, npy, 1, 1) via broadcast
 
     # Velocity: L2 norm ≤ eps_v
-    vel_dist = np.sqrt(vx**2 + vy**2) - c["eps_v"]   # (1, 1, nvx, nvy)
+    vel_dist = np.sqrt(vx**2 + vy**2 + 1e-8) - c["eps_v"]   # (1, 1, nvx, nvy)
 
     # Reach: must satisfy BOTH position AND velocity
     return np.broadcast_to(
@@ -399,33 +408,21 @@ def main(out_dir: str):
     print(f"  shape : {v_rot_all.shape}   time : {t_rot:.1f}s")
     print(f"  BRS  volume at tmax (V<0): {(v_rot_all[..., 0] < 0).mean():.4f}")
 
-    # -- Reconstruct full 6D BRAT (exact, Proposition 4) --------------------
-    print(f"\nReconstructing 6D BRAT over {T} time steps ...")
-    t0 = time.time()
-    v_brat = reconstruct_brat_6d(v_trans_all, v_rot_all)
-    t_recon = time.time() - t0
-    print(f"  shape : {v_brat.shape}   time : {t_recon:.1f}s")
-    print(f"  BRAT volume at tmax (V<0): {(v_brat[..., 0] < 0).mean():.4f}")
-
-    # -- Gap -----------------------------------------------------------------
-    print("\nComputing close_value_gap_all  |V_trans_6D - V_rot_6D| ...")
-    print("  NOTE: for independent subsystems this gap reflects constraint dominance,")
-    print("        NOT approximation error.  Large gaps are expected and benign.")
-    t0 = time.time()
-    close_value_gap_all = compute_close_value_gap(v_trans_all, v_rot_all)
-    t_gap = time.time() - t0
-    print(f"  shape : {close_value_gap_all.shape}   time : {t_gap:.1f}s")
-    print(f"  gap   mean={close_value_gap_all.mean():.4f}  max={close_value_gap_all.max():.4f}")
+    # -- Note on 6D reconstruction -------------------------------------------
+    # At paper resolution the full 6D array (51×51×31×31×361×141×T) is ~509 GB
+    # and cannot be stored.  Evaluate V6D on demand using:
+    #   V6D(x, t) = max(interp(v_trans_brs, x[:4], t),
+    #                   interp(v_rot_brs,   x[4:], t))
+    # reconstruct_brat_6d() and compute_close_value_gap() below are correct
+    # implementations for smaller grids; call them manually if needed.
 
     # -- Save ----------------------------------------------------------------
     v_trans_f32 = v_trans_all.astype(np.float32)
     v_rot_f32   = v_rot_all.astype(np.float32)
 
     saves = {
-        "v_trans_brs.npy":         v_trans_f32,
-        "v_rot_brs.npy":           v_rot_f32,
-        "v_brat.npy":              v_brat,
-        "close_value_gap_all.npy": close_value_gap_all,
+        "v_trans_brs.npy": v_trans_f32,
+        "v_rot_brs.npy":   v_rot_f32,
     }
     for fname, arr in saves.items():
         p = os.path.join(out_dir, fname)
@@ -449,40 +446,18 @@ def main(out_dir: str):
                 "axes": ["theta", "omega", "time"],
                 "note": "rotation BRS at each time step (no obstacle, no running-min clamping)",
             },
-            "v_brat": {
-                "path": "v_brat.npy",
-                "shape": list(v_brat.shape),
-                "axes": ["px", "py", "vx", "vy", "theta", "omega", "time"],
-                "note": "exact 6D BRAT at every time step; index 0 = full BRAT at tmax, index -1 = initial boundary_fn",
-            },
-            "close_value_gap_all": {
-                "path": "close_value_gap_all.npy",
-                "shape": list(close_value_gap_all.shape),
-                "axes": ["px", "py", "vx", "vy", "theta", "omega", "time"],
-                "note": (
-                    "|V_trans_6D - V_rot_6D|.  "
-                    "Subsystems are independent so this is NOT approximation error — "
-                    "it reflects which constraint dominates.  "
-                    "Used as adaptive guidance weight in DeepReach training."
-                ),
-            },
         },
         "reconstruction": {
-            "method": "Proposition 4, Chen et al. 2018 (exact for independent subsystems)",
-            "formula": "min_s max(v_trans_brs[...,s][...,None,None], v_rot_brs[...,s][None,None,None,None,:,:])",
-            "time_axis_convention": "index 0 = t=tmax (full BRAT), index -1 = t=0 (boundary_fn / target set)",
-            "brat_note": (
-                "Translation subsystem is solved as BRAT (reach pos/vel goal while avoiding "
-                "body+post obstacles, both inflated by rc=0.707 m).  "
-                "Rotation subsystem is solved as pure BRS (no obstacle in [theta,omega]).  "
-                "Full 6D BRAT = max(V_trans, V_rot); obstacle is embedded in V_trans."
+            "method": "Proposition 1 + 4, Chen et al. 2018 (exact for independent subsystems)",
+            "formula": "V6D(x,t) = max(interp(v_trans_brs, x[:4], t), interp(v_rot_brs, x[4:], t))",
+            "note": (
+                "Full 6D array infeasible at paper resolution (~509 GB). "
+                "Use reconstruct_brat_6d() with downsampled grids for small-scale testing."
             ),
         },
         "timing": {
-            "trans_seconds":  round(t_trans,  2),
-            "rot_seconds":    round(t_rot,    2),
-            "recon_seconds":  round(t_recon,  2),
-            "gap_seconds":    round(t_gap,    2),
+            "trans_seconds": round(t_trans, 2),
+            "rot_seconds":   round(t_rot,   2),
         },
     }
     manifest_path = os.path.join(out_dir, "artifact_manifest.json")

@@ -177,3 +177,4 @@ cython_debug/
 *.png
 /output_DubinsCar4D3
 /output_DubinsCar4D3_decomposed
+/output_*

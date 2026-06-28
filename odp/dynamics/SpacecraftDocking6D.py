@@ -1,3 +1,4 @@
+import math
 import numpy as np
 
 try:
@@ -6,6 +7,14 @@ try:
 except ImportError:
     hcl = None
     HCL_AVAILABLE = False
+
+# Default parameters — match paper code (Docking4D.py + Docking2D.py)
+_MU        = 3.986004418e14
+_R_EARTH   = 6371e3
+_ORBIT_ALT = 400e3
+_N_DEFAULT = math.sqrt(_MU / (_R_EARTH + _ORBIT_ALT) ** 3)  # ≈ 0.001133 rad/s
+_M_DEFAULT = 200.0           # chaser mass [kg]
+_I_DEFAULT = 200.0 / 6.0    # moment of inertia [kg*m^2] = 1/12 * m * (1^2 + 1^2)
 
 """
 6D Planar Spacecraft Docking Dynamics
@@ -44,9 +53,9 @@ class SpacecraftDocking6D:
         dMax=[0.0, 0.0, 0.0],
         uMode="min",
         dMode="max",
-        n=0.001131,
-        m=100.0,
-        I=50.0,
+        n=_N_DEFAULT,
+        m=_M_DEFAULT,
+        I=_I_DEFAULT,
     ):
         """
         Args:
