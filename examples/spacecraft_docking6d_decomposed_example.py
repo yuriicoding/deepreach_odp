@@ -68,7 +68,7 @@ _GOAL_Y_MIN = _GOAL_Y_MAX - _GOAL_BAND_HEIGHT           # = -1.400 m
 # ---------------------------------------------------------------------------
 CFG = {
     # time — matches DeepReach training horizon
-    "tmax": 10.0,
+    "tmax": 25.0,
     "dt": 0.1,
     "small_number": 1e-5,
 
