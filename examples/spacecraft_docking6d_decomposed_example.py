@@ -72,22 +72,19 @@ CFG = {
     "dt": 0.1,
     "small_number": 1e-5,
 
-    # translation grid [px (m), py (m), vx (m/s), vy (m/s)]
-    # Matches Docking4D.py: grid_resolution = (51, 51, 31, 31)
-    #   state_domain px/py ∈ [-15, 15], vx/vy ∈ [-1.5, 1.5]
-    # v_trans_brs shape: 51×51×31×31×251 × 4 bytes ≈ 2.5 GB
+    # grids — 35 pts per dimension across all subsystems
+    # v_trans_brs shape: 35^4 × T × 4 bytes ≈ 1.5 GB
+    # v_rot_brs   shape: 35^2 × T × 4 bytes ≈ 1.2 MB
+    # v_brat_all  shape: 35^6 × T × 4 bytes ≈ 1.85 TB  (full 6D reconstruction)
     "px_min": -15.0, "px_max": 15.0,
     "py_min": -15.0, "py_max": 15.0,
     "vx_min":  -1.5, "vx_max":  1.5,
     "vy_min":  -1.5, "vy_max":  1.5,
-    "npx": 51, "npy": 51, "nvx": 31, "nvy": 31,
+    "npx": 35, "npy": 35, "nvx": 35, "nvy": 35,
 
-    # rotation grid [theta (rad), omega (rad/s)]
-    # Matches Docking2D.py: grid_resolution = (361, 141)
-    #   state_domain theta ∈ [-π, π], omega ∈ [-2, 2]
     "th_min": -math.pi, "th_max": math.pi,
     "om_min":  -2.0,    "om_max":  2.0,
-    "nth": 361, "nom": 141,
+    "nth": 35, "nom": 35,
 
     # spacecraft parameters — match paper code
     "n": _N,             # mean motion [rad/s], computed from 400 km LEO
@@ -408,21 +405,23 @@ def main(out_dir: str):
     print(f"  shape : {v_rot_all.shape}   time : {t_rot:.1f}s")
     print(f"  BRS  volume at tmax (V<0): {(v_rot_all[..., 0] < 0).mean():.4f}")
 
-    # -- Note on 6D reconstruction -------------------------------------------
-    # At paper resolution the full 6D array (51×51×31×31×361×141×T) is ~509 GB
-    # and cannot be stored.  Evaluate V6D on demand using:
-    #   V6D(x, t) = max(interp(v_trans_brs, x[:4], t),
-    #                   interp(v_rot_brs,   x[4:], t))
-    # reconstruct_brat_6d() and compute_close_value_gap() below are correct
-    # implementations for smaller grids; call them manually if needed.
+    # -- Reconstruct full 6D BRAT --------------------------------------------
+    print("\nReconstructing full 6D BRAT  max(V_trans, V_rot)  over time ...")
+    t0 = time.time()
+    v_brat_all = reconstruct_brat_6d(v_trans_all, v_rot_all)
+    t_rec = time.time() - t0
+    print(f"  shape : {v_brat_all.shape}   time : {t_rec:.1f}s")
+    print(f"  BRAT  volume at tmax (V<0): {(v_brat_all[..., 0] < 0).mean():.4f}")
 
     # -- Save ----------------------------------------------------------------
     v_trans_f32 = v_trans_all.astype(np.float32)
     v_rot_f32   = v_rot_all.astype(np.float32)
+    v_brat_f32  = v_brat_all.astype(np.float32)
 
     saves = {
         "v_trans_brs.npy": v_trans_f32,
         "v_rot_brs.npy":   v_rot_f32,
+        "v_brat_all.npy":  v_brat_f32,
     }
     for fname, arr in saves.items():
         p = os.path.join(out_dir, fname)
@@ -446,18 +445,21 @@ def main(out_dir: str):
                 "axes": ["theta", "omega", "time"],
                 "note": "rotation BRS at each time step (no obstacle, no running-min clamping)",
             },
+            "v_brat_all": {
+                "path": "v_brat_all.npy",
+                "shape": list(v_brat_f32.shape),
+                "axes": ["px", "py", "vx", "vy", "theta", "omega", "time"],
+                "note": "full 6D BRAT at each time step; exact reconstruction via max(V_trans, V_rot)",
+            },
         },
         "reconstruction": {
             "method": "Proposition 1 + 4, Chen et al. 2018 (exact for independent subsystems)",
-            "formula": "V6D(x,t) = max(interp(v_trans_brs, x[:4], t), interp(v_rot_brs, x[4:], t))",
-            "note": (
-                "Full 6D array infeasible at paper resolution (~509 GB). "
-                "Use reconstruct_brat_6d() with downsampled grids for small-scale testing."
-            ),
+            "formula": "V6D(x,t) = max(V_trans(x[:4],t), V_rot(x[4:],t))",
         },
         "timing": {
             "trans_seconds": round(t_trans, 2),
             "rot_seconds":   round(t_rot,   2),
+            "reconstruct_seconds": round(t_rec, 2),
         },
     }
     manifest_path = os.path.join(out_dir, "artifact_manifest.json")
