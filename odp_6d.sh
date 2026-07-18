@@ -10,6 +10,7 @@ source /project/mars-lab/yha231/miniconda3/etc/profile.d/conda.sh
 conda activate odp
 
 cd /project/mars-lab/yha231/deepreach_odp
+export PYTHONPATH=/project/mars-lab/yha231/deepreach_odp:$PYTHONPATH
 
 srun python examples/spacecraft_docking6d_decomposed_example.py \
     --out_dir /localscratch/$USER/odp_6d_out/
