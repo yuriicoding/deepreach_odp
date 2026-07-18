@@ -28,8 +28,9 @@ INDEPENDENCE NOTE:
   max(interp(V_trans, x_trans, t), interp(V_rot, x_rot, t)).
 
 Output (written to --out_dir, default ./output_SpacecraftDocking6D_decomposed/):
-  v_trans_brs.npy  — translation BRAS at all time steps, (npx, npy, nvx, nvy, T) ~2.5 GB
-  v_rot_brs.npy    — rotation    BRS  at all time steps, (nth, nom, T)             ~51 MB
+  v_trans_brs.npy  — translation BRAS at all time steps, (npx, npy, nvx, nvy, T) ~210 MB
+  v_rot_brs.npy    — rotation    BRS  at all time steps, (nth, nom, T)             ~0.2 MB
+  v_brat_all.npy   — full 6D BRAT at all time steps,    (npx,npy,nvx,nvy,nth,nom,T) ~257 GB
 """
 
 import argparse
@@ -68,14 +69,14 @@ _GOAL_Y_MIN = _GOAL_Y_MAX - _GOAL_BAND_HEIGHT           # = -1.400 m
 # ---------------------------------------------------------------------------
 CFG = {
     # time — matches DeepReach training horizon
-    "tmax": 25.0,
-    "dt": 0.1,
+    "tmax": 17.0,
+    "dt": 0.5,
     "small_number": 1e-5,
 
     # grids — 35 pts per dimension across all subsystems
-    # v_trans_brs shape: 35^4 × T × 4 bytes ≈ 1.5 GB
-    # v_rot_brs   shape: 35^2 × T × 4 bytes ≈ 1.2 MB
-    # v_brat_all  shape: 35^6 × T × 4 bytes ≈ 1.85 TB  (full 6D reconstruction)
+    # v_trans_brs shape: 35^4 × T × 4 bytes ≈ 210 MB
+    # v_rot_brs   shape: 35^2 × T × 4 bytes ≈ 0.17 MB
+    # v_brat_all  shape: 35^6 × T × 4 bytes ≈ 257 GB  (full 6D reconstruction, T=35)
     "px_min": -15.0, "px_max": 15.0,
     "py_min": -15.0, "py_max": 15.0,
     "vx_min":  -1.5, "vx_max":  1.5,
