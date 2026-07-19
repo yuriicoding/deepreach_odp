@@ -417,12 +417,13 @@ def main(out_dir: str):
     # -- Save ----------------------------------------------------------------
     v_trans_f32 = v_trans_all.astype(np.float32)
     v_rot_f32   = v_rot_all.astype(np.float32)
-    v_brat_f32  = v_brat_all.astype(np.float32)
+    # v_brat_all is already float32 (reconstruct_brat_6d returns float32);
+    # calling astype(float32) on it would make a redundant 257 GB copy → OOM.
 
     saves = {
         "v_trans_brs.npy": v_trans_f32,
         "v_rot_brs.npy":   v_rot_f32,
-        "v_brat_all.npy":  v_brat_f32,
+        "v_brat_all.npy":  v_brat_all,
     }
     for fname, arr in saves.items():
         p = os.path.join(out_dir, fname)
@@ -448,7 +449,7 @@ def main(out_dir: str):
             },
             "v_brat_all": {
                 "path": "v_brat_all.npy",
-                "shape": list(v_brat_f32.shape),
+                "shape": list(v_brat_all.shape),
                 "axes": ["px", "py", "vx", "vy", "theta", "omega", "time"],
                 "note": "full 6D BRAT at each time step; exact reconstruction via max(V_trans, V_rot)",
             },
