@@ -424,19 +424,22 @@ def save_gap_memmap(v_trans_all, v_rot_all, out_path):
     running_max = np.float32(-np.inf)
     n_elements  = np.int64(0)
 
-    for i in range(T):
-        vt_i    = v_trans_all[..., i].astype(np.float32)   # (npx,npy,nvx,nvy)
-        vr_i    = v_rot_all[..., i].astype(np.float32)     # (nth,nom)
-        slice_i = np.abs(
-            vt_i[:, :, :, :, np.newaxis, np.newaxis]
-            - vr_i[np.newaxis, np.newaxis, np.newaxis, np.newaxis, :, :]
-        )                                                   # 7 GB in RAM
-        running_sum += slice_i.sum(dtype=np.float64)       # stats from RAM, no disk read
-        running_max  = max(running_max, slice_i.max())
-        n_elements  += slice_i.size
-        gap_mm[..., i] = slice_i                           # write T-last slice
-        if (i + 1) % max(1, T // 10) == 0 or i == T - 1:
-            print(f"    step {i + 1}/{T}")
+    # Iterate over px (outermost dim) so each gap_mm[px_idx] write is a
+    # contiguous (npy,nvx,nvy,nth,nom,T) block in the T-last C-layout.
+    # Iterating over T instead would scatter writes stride-140 across all 240 GB.
+    for px_idx in range(npx):
+        vt_px  = v_trans_all[px_idx, :, :, :, :].astype(np.float32)  # (npy,nvx,nvy,T)
+        vr_exp = v_rot_all.astype(np.float32)                          # (nth,nom,T)
+        slice_px = np.abs(
+            vt_px[:, :, :, np.newaxis, np.newaxis, :]      # (npy,nvx,nvy,1,1,T)
+            - vr_exp[np.newaxis, np.newaxis, np.newaxis, :, :, :]  # (1,1,1,nth,nom,T)
+        )                                                   # (npy,nvx,nvy,nth,nom,T) ~7 GB
+        running_sum += slice_px.sum(dtype=np.float64)
+        running_max  = max(running_max, float(slice_px.max()))
+        n_elements  += slice_px.size
+        gap_mm[px_idx] = slice_px                          # contiguous write
+        if (px_idx + 1) % max(1, npx // 10) == 0 or px_idx == npx - 1:
+            print(f"    step {px_idx + 1}/{npx}")
 
     gap_mm.flush()
     global_mean = float(running_sum / n_elements)
