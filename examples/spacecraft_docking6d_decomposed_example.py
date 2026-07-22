@@ -374,7 +374,8 @@ def save_brat_memmap(v_trans_all, v_rot_all, out_path):
     npx, npy, nvx, nvy  = v_trans_all.shape[:4]
     nth, nom            = v_rot_all.shape[:2]
 
-    shape   = (npx, npy, nvx, nvy, nth, nom, T)
+    # T-first layout for contiguous per-step writes (same reason as save_gap_memmap).
+    shape   = (T, npx, npy, nvx, nvy, nth, nom)
     size_gb = int(np.prod(shape)) * 4 / 1e9
     print(f"  shape={shape}  {size_gb:.1f} GB  → {out_path}")
 
@@ -383,11 +384,11 @@ def save_brat_memmap(v_trans_all, v_rot_all, out_path):
     scratch     = np.empty((npx, npy, nvx, nvy, nth, nom), dtype=np.float32)
 
     for i in range(T - 1, -1, -1):
-        brs_t = v_trans_all[..., i].astype(np.float32)[:, :, :, :, np.newaxis, np.newaxis]  # (npx,npy,nvx,nvy,1,1)
-        brs_r = v_rot_all[..., i].astype(np.float32)[np.newaxis, np.newaxis, np.newaxis, np.newaxis, :, :]  # (1,1,1,1,nth,nom)
-        np.maximum(brs_t, brs_r, out=scratch)               # bras_6d = max(V_trans, V_rot)
-        np.minimum(running_min, scratch, out=running_min)   # union over time
-        brat_mm[..., i] = running_min
+        brs_t = v_trans_all[..., i].astype(np.float32)[:, :, :, :, np.newaxis, np.newaxis]
+        brs_r = v_rot_all[..., i].astype(np.float32)[np.newaxis, np.newaxis, np.newaxis, np.newaxis, :, :]
+        np.maximum(brs_t, brs_r, out=scratch)
+        np.minimum(running_min, scratch, out=running_min)
+        brat_mm[i] = running_min
         if (T - i) % max(1, T // 10) == 0 or i == 0:
             print(f"    step {T - i}/{T}")
 
@@ -398,10 +399,9 @@ def save_brat_memmap(v_trans_all, v_rot_all, out_path):
 def save_gap_memmap(v_trans_all, v_rot_all, out_path):
     """Write |V_trans_6D - V_rot_6D| to an .npy file one time-slice at a time.
 
-    The full 6D gap array (npx,npy,nvx,nvy,nth,nom,T) is ~257 GB at paper
-    resolution. Computing it all at once needs 2× that in RAM (result + temp
-    from np.abs). This function keeps only one (npx,npy,nvx,nvy,nth,nom) slice
-    (~7 GB) in RAM at a time and writes it directly to a memory-mapped .npy file.
+    Output shape: (npx, npy, nvx, nvy, nth, nom, T) — T-last, consistent with v_brat_all.
+    Each step computes a 7 GB slice in RAM, accumulates stats, then writes to memmap.
+    Stats are computed from the in-RAM slice so there are no read-backs from disk.
 
     Args:
         v_trans_all : (npx, npy, nvx, nvy, T)
@@ -409,7 +409,7 @@ def save_gap_memmap(v_trans_all, v_rot_all, out_path):
         out_path    : destination .npy path (written as memmap)
 
     Returns:
-        np.memmap view of the saved array
+        (gap_mm, global_mean, global_max)
     """
     T                   = v_trans_all.shape[-1]
     npx, npy, nvx, nvy  = v_trans_all.shape[:4]
@@ -425,16 +425,16 @@ def save_gap_memmap(v_trans_all, v_rot_all, out_path):
     n_elements  = np.int64(0)
 
     for i in range(T):
-        vt_i = v_trans_all[..., i].astype(np.float32)   # (npx,npy,nvx,nvy)
-        vr_i = v_rot_all[..., i].astype(np.float32)     # (nth,nom)
-        np.abs(
+        vt_i    = v_trans_all[..., i].astype(np.float32)   # (npx,npy,nvx,nvy)
+        vr_i    = v_rot_all[..., i].astype(np.float32)     # (nth,nom)
+        slice_i = np.abs(
             vt_i[:, :, :, :, np.newaxis, np.newaxis]
-            - vr_i[np.newaxis, np.newaxis, np.newaxis, np.newaxis, :, :],
-            out=gap_mm[..., i],
-        )
-        running_sum += gap_mm[..., i].sum(dtype=np.float64)
-        running_max  = max(running_max, gap_mm[..., i].max())
-        n_elements  += gap_mm[..., i].size
+            - vr_i[np.newaxis, np.newaxis, np.newaxis, np.newaxis, :, :]
+        )                                                   # 7 GB in RAM
+        running_sum += slice_i.sum(dtype=np.float64)       # stats from RAM, no disk read
+        running_max  = max(running_max, slice_i.max())
+        n_elements  += slice_i.size
+        gap_mm[..., i] = slice_i                           # write T-last slice
         if (i + 1) % max(1, T // 10) == 0 or i == T - 1:
             print(f"    step {i + 1}/{T}")
 
@@ -514,7 +514,7 @@ def main(out_dir: str):
     v_brat_all = save_brat_memmap(v_trans_f32, v_rot_f32, brat_path)
     t_rec = time.time() - t0
     print(f"  time : {t_rec:.1f}s")
-    print(f"  BRAT  volume at tmax (V<0): {(v_brat_all[..., 0] < 0).mean():.4f}")
+    print(f"  BRAT  volume at tmax (V<0): {(v_brat_all[0] < 0).mean():.4f}")
 
     # -- Manifest ------------------------------------------------------------
     manifest = {
