@@ -355,12 +355,97 @@ def reconstruct_brat_6d(v_trans_all, v_rot_all):
     return brat_all   # (npx, npy, nvx, nvy, nth, nom, T)
 
 
+def save_brat_memmap(v_trans_all, v_rot_all, out_path):
+    """Reconstruct full 6D BRAT and write it to disk one time-slice at a time.
+
+    Same logic as reconstruct_brat_6d (Proposition 1 + 4, Chen et al. 2018)
+    but keeps only two (npx,npy,nvx,nvy,nth,nom) arrays in RAM (~15 GB total)
+    instead of the full (npx,npy,nvx,nvy,nth,nom,T) array (~257 GB).
+
+    Args:
+        v_trans_all : (npx, npy, nvx, nvy, T)
+        v_rot_all   : (nth, nom, T)
+        out_path    : destination .npy path (written as memmap)
+
+    Returns:
+        np.memmap view of the saved array
+    """
+    T                   = v_trans_all.shape[-1]
+    npx, npy, nvx, nvy  = v_trans_all.shape[:4]
+    nth, nom            = v_rot_all.shape[:2]
+
+    shape   = (npx, npy, nvx, nvy, nth, nom, T)
+    size_gb = int(np.prod(shape)) * 4 / 1e9
+    print(f"  shape={shape}  {size_gb:.1f} GB  → {out_path}")
+
+    brat_mm     = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=shape)
+    running_min = np.full((npx, npy, nvx, nvy, nth, nom), fill_value=np.inf, dtype=np.float32)
+    scratch     = np.empty((npx, npy, nvx, nvy, nth, nom), dtype=np.float32)
+
+    for i in range(T - 1, -1, -1):
+        brs_t = v_trans_all[..., i].astype(np.float32)[:, :, :, :, np.newaxis, np.newaxis]  # (npx,npy,nvx,nvy,1,1)
+        brs_r = v_rot_all[..., i].astype(np.float32)[np.newaxis, np.newaxis, np.newaxis, np.newaxis, :, :]  # (1,1,1,1,nth,nom)
+        np.maximum(brs_t, brs_r, out=scratch)               # bras_6d = max(V_trans, V_rot)
+        np.minimum(running_min, scratch, out=running_min)   # union over time
+        brat_mm[..., i] = running_min
+        if (T - i) % max(1, T // 10) == 0 or i == 0:
+            print(f"    step {T - i}/{T}")
+
+    brat_mm.flush()
+    return brat_mm
+
+
+def save_gap_memmap(v_trans_all, v_rot_all, out_path):
+    """Write |V_trans_6D - V_rot_6D| to an .npy file one time-slice at a time.
+
+    The full 6D gap array (npx,npy,nvx,nvy,nth,nom,T) is ~257 GB at paper
+    resolution. Computing it all at once needs 2× that in RAM (result + temp
+    from np.abs). This function keeps only one (npx,npy,nvx,nvy,nth,nom) slice
+    (~7 GB) in RAM at a time and writes it directly to a memory-mapped .npy file.
+
+    Args:
+        v_trans_all : (npx, npy, nvx, nvy, T)
+        v_rot_all   : (nth, nom, T)
+        out_path    : destination .npy path (written as memmap)
+
+    Returns:
+        np.memmap view of the saved array
+    """
+    T                   = v_trans_all.shape[-1]
+    npx, npy, nvx, nvy  = v_trans_all.shape[:4]
+    nth, nom            = v_rot_all.shape[:2]
+
+    shape   = (npx, npy, nvx, nvy, nth, nom, T)
+    size_gb = int(np.prod(shape)) * 4 / 1e9
+    print(f"  shape={shape}  {size_gb:.1f} GB  → {out_path}")
+
+    gap_mm = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=shape)
+
+    for i in range(T):
+        vt_i = v_trans_all[..., i].astype(np.float32)   # (npx,npy,nvx,nvy)
+        vr_i = v_rot_all[..., i].astype(np.float32)     # (nth,nom)
+        np.abs(
+            vt_i[:, :, :, :, np.newaxis, np.newaxis]
+            - vr_i[np.newaxis, np.newaxis, np.newaxis, np.newaxis, :, :],
+            out=gap_mm[..., i],
+        )
+        if (i + 1) % max(1, T // 10) == 0 or i == T - 1:
+            print(f"    step {i + 1}/{T}")
+
+    gap_mm.flush()
+    return gap_mm
+
+
 def compute_close_value_gap(v_trans_all, v_rot_all):
     """Compute per-grid-point gap |V_trans_6D - V_rot_6D| at every time step.
 
     For independent subsystems this gap is NOT an approximation error.
     It indicates which subsystem is the binding constraint at each 6D point
     and is used in DeepReach as an adaptive guidance weight.
+
+    NOTE: result is (npx,npy,nvx,nvy,nth,nom,T) — 257 GB at paper resolution.
+    Peak RAM during this call is 2× (result + abs temporary). Use save_gap_memmap
+    to stay within memory limits.
 
     Args:
         v_trans_all : (npx, npy, nvx, nvy, T)
@@ -406,30 +491,22 @@ def main(out_dir: str):
     print(f"  shape : {v_rot_all.shape}   time : {t_rot:.1f}s")
     print(f"  BRS  volume at tmax (V<0): {(v_rot_all[..., 0] < 0).mean():.4f}")
 
-    # -- Reconstruct full 6D BRAT --------------------------------------------
-    print("\nReconstructing full 6D BRAT  max(V_trans, V_rot)  over time ...")
-    t0 = time.time()
-    v_brat_all = reconstruct_brat_6d(v_trans_all, v_rot_all)
-    t_rec = time.time() - t0
-    print(f"  shape : {v_brat_all.shape}   time : {t_rec:.1f}s")
-    print(f"  BRAT  volume at tmax (V<0): {(v_brat_all[..., 0] < 0).mean():.4f}")
-
-    # -- Save ----------------------------------------------------------------
+    # -- Save subsystem arrays (small — fits in RAM) -------------------------
     v_trans_f32 = v_trans_all.astype(np.float32)
     v_rot_f32   = v_rot_all.astype(np.float32)
-    # v_brat_all is already float32 (reconstruct_brat_6d returns float32);
-    # calling astype(float32) on it would make a redundant 257 GB copy → OOM.
-
-    saves = {
-        "v_trans_brs.npy": v_trans_f32,
-        "v_rot_brs.npy":   v_rot_f32,
-        "v_brat_all.npy":  v_brat_all,
-    }
-    for fname, arr in saves.items():
+    for fname, arr in [("v_trans_brs.npy", v_trans_f32), ("v_rot_brs.npy", v_rot_f32)]:
         p = os.path.join(out_dir, fname)
         np.save(p, arr)
-        mb = arr.nbytes / 1e6
-        print(f"Saved {fname:30s} shape={str(arr.shape):40s} {mb:.1f} MB  → {p}")
+        print(f"Saved {fname:30s} shape={str(arr.shape):30s} {arr.nbytes/1e6:.1f} MB  → {p}")
+
+    # -- Reconstruct full 6D BRAT (memmap: only ~15 GB in RAM at any time) --
+    print("\nReconstructing full 6D BRAT  max(V_trans, V_rot)  over time ...")
+    t0 = time.time()
+    brat_path  = os.path.join(out_dir, "v_brat_all.npy")
+    v_brat_all = save_brat_memmap(v_trans_f32, v_rot_f32, brat_path)
+    t_rec = time.time() - t0
+    print(f"  time : {t_rec:.1f}s")
+    print(f"  BRAT  volume at tmax (V<0): {(v_brat_all[..., 0] < 0).mean():.4f}")
 
     # -- Manifest ------------------------------------------------------------
     manifest = {
@@ -487,16 +564,14 @@ def main_gap_only(out_dir: str):
     print(f"  v_trans_brs shape : {v_trans_all.shape}")
     print(f"  v_rot_brs   shape : {v_rot_all.shape}")
 
-    print("Computing close_value_gap_all ...")
+    print("Computing close_value_gap_all (slice-by-slice, memmap) ...")
     t0 = time.time()
-    close_value_gap_all = compute_close_value_gap(v_trans_all, v_rot_all)
+    gap_path = os.path.join(out_dir, "close_value_gap_all.npy")
+    close_value_gap_all = save_gap_memmap(v_trans_all, v_rot_all, gap_path)
     t_gap = time.time() - t0
     print(f"  shape : {close_value_gap_all.shape}   time : {t_gap:.1f}s")
     print(f"  gap   mean={close_value_gap_all.mean():.4f}  max={close_value_gap_all.max():.4f}")
-
-    gap_path = os.path.join(out_dir, "close_value_gap_all.npy")
-    np.save(gap_path, close_value_gap_all)
-    print(f"Saved close_value_gap_all.npy  shape={close_value_gap_all.shape}  → {gap_path}")
+    print(f"Saved close_value_gap_all.npy  → {gap_path}")
 
     manifest_path = os.path.join(out_dir, "artifact_manifest.json")
     if os.path.exists(manifest_path):
