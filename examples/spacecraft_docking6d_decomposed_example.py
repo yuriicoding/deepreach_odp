@@ -419,7 +419,10 @@ def save_gap_memmap(v_trans_all, v_rot_all, out_path):
     size_gb = int(np.prod(shape)) * 4 / 1e9
     print(f"  shape={shape}  {size_gb:.1f} GB  → {out_path}")
 
-    gap_mm = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=shape)
+    gap_mm      = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=shape)
+    running_sum = np.float64(0.0)
+    running_max = np.float32(-np.inf)
+    n_elements  = np.int64(0)
 
     for i in range(T):
         vt_i = v_trans_all[..., i].astype(np.float32)   # (npx,npy,nvx,nvy)
@@ -429,11 +432,16 @@ def save_gap_memmap(v_trans_all, v_rot_all, out_path):
             - vr_i[np.newaxis, np.newaxis, np.newaxis, np.newaxis, :, :],
             out=gap_mm[..., i],
         )
+        running_sum += gap_mm[..., i].sum(dtype=np.float64)
+        running_max  = max(running_max, gap_mm[..., i].max())
+        n_elements  += gap_mm[..., i].size
         if (i + 1) % max(1, T // 10) == 0 or i == T - 1:
             print(f"    step {i + 1}/{T}")
 
     gap_mm.flush()
-    return gap_mm
+    global_mean = float(running_sum / n_elements)
+    global_max  = float(running_max)
+    return gap_mm, global_mean, global_max
 
 
 def compute_close_value_gap(v_trans_all, v_rot_all):
@@ -567,10 +575,10 @@ def main_gap_only(out_dir: str):
     print("Computing close_value_gap_all (slice-by-slice, memmap) ...")
     t0 = time.time()
     gap_path = os.path.join(out_dir, "close_value_gap_all.npy")
-    close_value_gap_all = save_gap_memmap(v_trans_all, v_rot_all, gap_path)
+    close_value_gap_all, gap_mean, gap_max = save_gap_memmap(v_trans_all, v_rot_all, gap_path)
     t_gap = time.time() - t0
     print(f"  shape : {close_value_gap_all.shape}   time : {t_gap:.1f}s")
-    print(f"  gap   mean={close_value_gap_all.mean():.4f}  max={close_value_gap_all.max():.4f}")
+    print(f"  gap   mean={gap_mean:.4f}  max={gap_max:.4f}")
     print(f"Saved close_value_gap_all.npy  → {gap_path}")
 
     manifest_path = os.path.join(out_dir, "artifact_manifest.json")
