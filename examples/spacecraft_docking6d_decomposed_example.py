@@ -556,23 +556,27 @@ def main(out_dir: str):
     print(f"  BRAT  volume at tmax (V<0): {(v_brat_all[0] < 0).mean():.4f}")
 
     # -- Manifest ------------------------------------------------------------
+    # Paths are absolute: the manifest is consumed from a different directory
+    # than the one holding the arrays (see odp_6d.sh).
+    root = os.path.abspath(out_dir)
     manifest = {
         "version": 1,
+        "root": root,
         "values": {
             "v_trans_brs": {
-                "path": "v_trans_brs.npy",
+                "path": os.path.join(root, "v_trans_brs.npy"),
                 "shape": list(v_trans_f32.shape),
                 "axes": ["px", "py", "vx", "vy", "time"],
                 "note": "translation BRAS at each time step (obstacle-enforced, no running-min clamping)",
             },
             "v_rot_brs": {
-                "path": "v_rot_brs.npy",
+                "path": os.path.join(root, "v_rot_brs.npy"),
                 "shape": list(v_rot_f32.shape),
                 "axes": ["theta", "omega", "time"],
                 "note": "rotation BRS at each time step (no obstacle, no running-min clamping)",
             },
             "v_brat_all": {
-                "path": "v_brat_all.npy",
+                "path": os.path.join(root, "v_brat_all.npy"),
                 "shape": list(v_brat_all.shape),
                 "axes": ["px", "py", "vx", "vy", "theta", "omega", "time"],
                 "note": "full 6D BRAT at each time step; exact reconstruction via max(V_trans, V_rot)",
@@ -625,7 +629,7 @@ def main_gap_only(out_dir: str):
         with open(manifest_path) as f:
             manifest = json.load(f)
         manifest.setdefault("values", {})["close_value_gap_all"] = {
-            "path": "close_value_gap_all.npy",
+            "path": os.path.abspath(gap_path),
             "shape": list(close_value_gap_all.shape),
             "axes": ["px", "py", "vx", "vy", "theta", "omega", "time"],
             "note": "|V_trans_6D - V_rot_6D|; adaptive guidance weight in DeepReach training",
