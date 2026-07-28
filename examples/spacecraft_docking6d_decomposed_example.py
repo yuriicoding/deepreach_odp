@@ -130,6 +130,31 @@ CFG = {
 # ---------------------------------------------------------------------------
 # Level-set shape helpers (computed on ODP grid.vs arrays via broadcasting)
 # ---------------------------------------------------------------------------
+#
+# DeepReach-matching value shaping
+# --------------------------------
+# DeepReach's SpacecraftDocking6D.reach_fn / avoid_fn do NOT use raw signed
+# distances. Each component distance d is reshaped by a piecewise map
+#   inside  tolerance (d <  0): d * <steep_gain>        (amplify)
+#   outside tolerance (d >= 0): tanh(d * <tanh_scale>)  (saturate)
+# the reach value is the max over components times _REACH_SCALE (1.2), and the
+# obstacle distance is amplified 1.5x inside the obstacle. Applying the SAME
+# shaping here keeps this ground-truth grid's value MAGNITUDES comparable to
+# the DeepReach model (both share the same zero level set either way).
+#
+# The max-decomposition V6D = max(V_trans, V_rot) stays EXACT under this
+# reshaping: each per-component map is monotonic, max distributes over the
+# trans/rot split, and the positive scalars 1.2 / 1.5 commute with max. So the
+# Chen et al. 2018 (Prop 1+4) hypotheses — decoupled dynamics + max-decomposed
+# terminal cost — are unchanged.
+
+_REACH_SCALE = 1.2   # DeepReach reach_fn final multiplier
+
+
+def _shape_dist(d, steep_gain, tanh_scale):
+    """DeepReach per-component reshaping: amplify inside, tanh-saturate outside."""
+    return np.where(d < 0, d * steep_gain, np.tanh(d * tanh_scale))
+
 
 def trans_reach_fn(g, c):
     """Translation reach set level-function on 4D grid [px, py, vx, vy].
@@ -137,7 +162,8 @@ def trans_reach_fn(g, c):
     g(z_trans) ≤ 0  iff  |px| ≤ eps_p  AND  py ∈ [goal_y_min, goal_y_max]
                           AND  ||[vx,vy]|| ≤ eps_v
 
-    Uses the max-of-signed-distances convention (level ≤ 0 → in set).
+    Sign convention: level ≤ 0 → in set. Component distances are reshaped to
+    match DeepReach reach_fn (tanh-saturated outside, amplified inside, ×1.2).
     """
     px = g.vs[0]   # (npx,  1,   1,   1)
     py = g.vs[1]   # ( 1,  npy,  1,   1)
@@ -155,11 +181,13 @@ def trans_reach_fn(g, c):
     # Velocity: L2 norm ≤ eps_v
     vel_dist = np.sqrt(vx**2 + vy**2 + 1e-8) - c["eps_v"]   # (1, 1, nvx, nvy)
 
-    # Reach: must satisfy BOTH position AND velocity
-    return np.broadcast_to(
-        np.maximum(pos_dist, vel_dist),
-        tuple(g.pts_each_dim),
-    ).copy().astype(np.float64)
+    # DeepReach reshaping (reach_fn): pos *20 / tanh(*0.5), vel *20 / tanh(*1.0)
+    pos_dist = _shape_dist(pos_dist, 20.0, 0.5)
+    vel_dist = _shape_dist(vel_dist, 20.0, 1.0)
+
+    # Reach: must satisfy BOTH position AND velocity; ×1.2 (see rot_reach_fn note)
+    reach = np.maximum(pos_dist, vel_dist) * _REACH_SCALE
+    return np.broadcast_to(reach, tuple(g.pts_each_dim)).copy().astype(np.float64)
 
 
 def avoid_fn(g, c):
@@ -192,6 +220,9 @@ def avoid_fn(g, c):
     # Union of obstacles: l > 0 ↔ outside BOTH (safe)
     s_fail = np.minimum(s_body, s_post)     # (npx, npy, 1, 1)
 
+    # DeepReach reshaping (avoid_fn): amplify 1.5x inside obstacle, raw outside
+    s_fail = np.where(s_fail < 0, s_fail * 1.5, s_fail)
+
     return np.broadcast_to(s_fail, tuple(g.pts_each_dim)).copy().astype(np.float64)
 
 
@@ -214,10 +245,15 @@ def rot_reach_fn(g, c):
 
     omega_dist = np.abs(omega) - c["eps_w"]
 
-    return np.broadcast_to(
-        np.maximum(theta_dist, omega_dist),
-        tuple(g.pts_each_dim),
-    ).copy().astype(np.float64)
+    # DeepReach reshaping (reach_fn): theta *150 / tanh(*1.0), omega *30 / tanh(*1.0).
+    # ×1.2 is applied to BOTH subsystems so the reconstruction
+    #   max(V_trans, V_rot) = 1.2 * max(pos, vel, theta, rate)
+    # reproduces DeepReach's reach_fn (which multiplies the 4-way max by 1.2).
+    theta_dist = _shape_dist(theta_dist, 150.0, 1.0)
+    omega_dist = _shape_dist(omega_dist, 30.0, 1.0)
+
+    reach = np.maximum(theta_dist, omega_dist) * _REACH_SCALE
+    return np.broadcast_to(reach, tuple(g.pts_each_dim)).copy().astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
