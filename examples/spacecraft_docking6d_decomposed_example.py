@@ -392,11 +392,23 @@ def reconstruct_brat_6d(v_trans_all, v_rot_all):
 
 
 def save_brat_memmap(v_trans_all, v_rot_all, out_path):
-    """Reconstruct full 6D BRAT and write it to disk one time-slice at a time.
+    """Reconstruct full 6D BRAT and write it to disk one px-slice at a time.
 
-    Same logic as reconstruct_brat_6d (Proposition 1 + 4, Chen et al. 2018)
-    but keeps only two (npx,npy,nvx,nvy,nth,nom) arrays in RAM (~15 GB total)
-    instead of the full (npx,npy,nvx,nvy,nth,nom,T) array (~257 GB).
+    Same logic as reconstruct_brat_6d (Proposition 1 + 4, Chen et al. 2018),
+    and produces byte-for-byte the same values — just streamed to disk.
+
+    The running-min-over-time (BRAT = level-set union of BRAS over the horizon)
+    is a per-cell reduction along the time axis, so it decomposes EXACTLY over
+    spatial blocks: iterate over px (outermost spatial dim) and take a reverse
+    cumulative-min along time within each slice. This keeps only ~15 GB in RAM
+    (one (npy,nvx,nvy,nth,nom,T) slice plus its accumulate temp) instead of the
+    full (npx,npy,nvx,nvy,nth,nom,T) array (~257 GB).
+
+    Output layout is T-LAST — (npx, npy, nvx, nvy, nth, nom, T) — matching
+    v_trans_brs / v_rot_brs / close_value_gap_all and every downstream reader
+    (DeepReach dataio, inference, comparison). Time index 0 = tmax, index -1 =
+    t = 0, same as HJSolver. Each out[px_idx] write is a contiguous C-layout
+    block, so no strided scatter.
 
     Args:
         v_trans_all : (npx, npy, nvx, nvy, T)
@@ -404,29 +416,33 @@ def save_brat_memmap(v_trans_all, v_rot_all, out_path):
         out_path    : destination .npy path (written as memmap)
 
     Returns:
-        np.memmap view of the saved array
+        np.memmap view of the saved array, shape (npx, npy, nvx, nvy, nth, nom, T)
     """
     T                   = v_trans_all.shape[-1]
     npx, npy, nvx, nvy  = v_trans_all.shape[:4]
     nth, nom            = v_rot_all.shape[:2]
 
-    # T-first layout for contiguous per-step writes (same reason as save_gap_memmap).
-    shape   = (T, npx, npy, nvx, nvy, nth, nom)
+    shape   = (npx, npy, nvx, nvy, nth, nom, T)
     size_gb = int(np.prod(shape)) * 4 / 1e9
     print(f"  shape={shape}  {size_gb:.1f} GB  → {out_path}")
 
-    brat_mm     = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=shape)
-    running_min = np.full((npx, npy, nvx, nvy, nth, nom), fill_value=np.inf, dtype=np.float32)
-    scratch     = np.empty((npx, npy, nvx, nvy, nth, nom), dtype=np.float32)
+    brat_mm = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=shape)
+    vr_f32  = v_rot_all.astype(np.float32)   # (nth, nom, T)
 
-    for i in range(T - 1, -1, -1):
-        brs_t = v_trans_all[..., i].astype(np.float32)[:, :, :, :, np.newaxis, np.newaxis]
-        brs_r = v_rot_all[..., i].astype(np.float32)[np.newaxis, np.newaxis, np.newaxis, np.newaxis, :, :]
-        np.maximum(brs_t, brs_r, out=scratch)
-        np.minimum(running_min, scratch, out=running_min)
-        brat_mm[i] = running_min
-        if (T - i) % max(1, T // 10) == 0 or i == 0:
-            print(f"    step {T - i}/{T}")
+    for px_idx in range(npx):
+        # BRAS(t) at this px slice = max(V_trans, V_rot) lifted to 6D, all t.
+        vt_px = v_trans_all[px_idx].astype(np.float32)   # (npy, nvx, nvy, T)
+        bras = np.maximum(
+            vt_px[:, :, :, np.newaxis, np.newaxis, :],           # (npy,nvx,nvy,1,1,T)
+            vr_f32[np.newaxis, np.newaxis, np.newaxis, :, :, :],  # (1,1,1,nth,nom,T)
+        )                                                         # (npy,nvx,nvy,nth,nom,T)
+        # BRAT(t) = union_{s>=t} BRAS(s) = min over j>=i of BRAS[..., j].
+        # Reverse cumulative-min along the (last) time axis realises min_{j>=i},
+        # exactly matching the sequential running-min in reconstruct_brat_6d.
+        brat_px = np.minimum.accumulate(bras[..., ::-1], axis=-1)[..., ::-1]
+        brat_mm[px_idx] = brat_px                                 # contiguous write
+        if (px_idx + 1) % max(1, npx // 10) == 0 or px_idx == npx - 1:
+            print(f"    step {px_idx + 1}/{npx}")
 
     brat_mm.flush()
     return brat_mm
