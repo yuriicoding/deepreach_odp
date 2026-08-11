@@ -15,3 +15,6 @@ from odp.dynamics.DubinsAirplane6D import DubinsAirplane6D
 from odp.dynamics.SpacecraftDocking6D import SpacecraftDocking6D
 from odp.dynamics.SpacecraftDocking6DTrans import SpacecraftDocking6DTrans
 from odp.dynamics.SpacecraftDocking6DRot import SpacecraftDocking6DRot
+from odp.dynamics.QuadrotorHover10DX import QuadrotorHover10DX
+from odp.dynamics.QuadrotorHover10DY import QuadrotorHover10DY
+from odp.dynamics.QuadrotorHover10DZ import QuadrotorHover10DZ
