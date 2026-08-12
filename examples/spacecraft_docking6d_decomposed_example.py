@@ -59,8 +59,8 @@ _H_C = 1.0                           # chaser height [m]
 _RC  = math.sqrt(_W_C**2 + _H_C**2) / 2   # bounding-circle radius = sqrt(2)/2 ≈ 0.7071 m
 
 _POST_LENGTH      = 0.2              # docking post length [m]
-_GOAL_CLEARANCE   = -0.007           # goal top is 7 mm inside inflated post boundary [m]
-_GOAL_BAND_HEIGHT = 0.5              # goal band height [m]
+_GOAL_CLEARANCE   = 0.143           # goal top is 7 mm inside inflated post boundary [m]
+_GOAL_BAND_HEIGHT = 0.2              # goal band height [m]
 _GOAL_Y_MAX = -(_POST_LENGTH + _RC + _GOAL_CLEARANCE)   # ≈ -0.900 m
 _GOAL_Y_MIN = _GOAL_Y_MAX - _GOAL_BAND_HEIGHT           # = -1.400 m
 
@@ -69,8 +69,8 @@ _GOAL_Y_MIN = _GOAL_Y_MAX - _GOAL_BAND_HEIGHT           # = -1.400 m
 # ---------------------------------------------------------------------------
 CFG = {
     # time — matches DeepReach training horizon
-    "tmax": 17.0,
-    "dt": 0.5,
+    "tmax": 10.0,
+    "dt": 0.3,
     "small_number": 1e-5,
 
     # grids — 35 pts per dimension across all subsystems
@@ -80,11 +80,11 @@ CFG = {
     "px_min": -15.0, "px_max": 15.0,
     "py_min": -15.0, "py_max": 15.0,
     "vx_min":  -1.5, "vx_max":  1.5,
-    "vy_min":  -1.5, "vy_max":  1.5,
+    "vy_min":  -2.0, "vy_max":  2.0,
     "npx": 35, "npy": 35, "nvx": 35, "nvy": 35,
 
     "th_min": -math.pi, "th_max": math.pi,
-    "om_min":  -2.0,    "om_max":  2.0,
+    "om_min":  -1.0,    "om_max":  1.0,
     "nth": 35, "nom": 35,
 
     # spacecraft parameters — match paper code
