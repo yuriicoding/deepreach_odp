@@ -21,7 +21,9 @@ rm -rf "$OUT_DIR"
 
 # 1) Solve the 3 decomposed subsystems (X 4D, Y 4D, Z 2D).
 #    No full 10D grid is reconstructed — it would be ~5.2e16 cells per time
-#    step. DeepReach evaluates max(Vx, Vy, Vz) on demand from these arrays.
+#    step. The arrays are per-step BRS; DeepReach reconstructs the BRT on
+#    demand as min-over-time of max(Vx, Vy, Vz) — max first, then min. Taking
+#    the max alone gives the BRS at a single t (see manifest formula_brt).
 #    Memory is modest (~690 MB per 4D array), hence 64G rather than the 6D
 #    job's 350G.
 srun python -u examples/quadrotor10d_decomposed_example.py \

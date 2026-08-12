@@ -20,44 +20,62 @@ this script writes ONLY the three subsystem arrays. The full 10D grid would be
 41^4 * 41^4 * 81^2 ~= 5.2e16 cells (~2e8 GB per time step) — not
 representable at any resolution worth having. Downstream consumers evaluate
 
-    V_10D(x, t) = max( Vx(x[0:4], t), Vy(x[4:8], t), Vz(x[8:10], t) )
+    BRS at one t :  V_10D(x, t) = max_i V_i(x_i, t)
+    BRT over [0,t]: V_10D(x, t) = min_{s <= t} max_i V_i(x_i, s)
 
-on demand by interpolating each subsystem array at the projected state.
+on demand by interpolating each subsystem array at the projected state — see
+reconstruct_brt_pointwise() below.
 
-BRT, NOT BRS — and the ordering caveat that comes with it
----------------------------------------------------------
-Each subsystem is solved with TargetSetMode="minVWithV0", so every step is
-clamped as min(V_evolved, l) against the target function. The saved arrays are
-therefore per-subsystem BRTs (running-min), NOT the per-time-step BRS.
+PER-STEP BRS — the ordering the decomposition theory requires
+-------------------------------------------------------------
+Each subsystem is solved with TargetSetMode="none", so NO min(V, l) clamp is
+applied and the saved arrays are the PER-TIME-STEP BRS. That is what the
+max-decomposition needs: Chen et al. 2018 (Prop. 1 + 4) holds per time step,
+and the union-over-time does not commute with the intersection-over-subsystems:
 
-That is a deliberate choice, and it is NOT the ordering the decomposition
-theory wants. The max-decomposition (Chen et al. 2018, Prop. 1 + 4) holds per
-time step, and the union-over-time does not commute with the
-intersection-over-subsystems:
+    EXACT   (what this does)  :  V_BRT(x, t) = min_{s<=t} max_i V_i^BRS(x_i, s)
+    WRONG   (what v2 did)     :  V_BRT(x, t) = max_i min_{s<=t} V_i(x_i, s)
 
-    EXACT      :  V_BRT(x, t) = min_{s <= t} max_i V_i^BRS(x_i, s)
-    WHAT WE DO :  V_BRT(x, t) = max_i min_{s <= t} V_i(x_i, s) = max_i V_i^BRT
+Since max_i min_s (...) <= min_s max_i (...), the v2 form under-estimated the
+value and so OVER-estimated the BRT. The two agree only if each subsystem can
+wait inside its own target box until the others arrive, and that box is not
+control-invariant here: from the vx = 0.2 corner, px overshoots to ~0.28 before
+theta can decelerate it.
 
-Since max_i min_s (...) <= min_s max_i (...), reconstructing from these arrays
-UNDER-estimates the value and so OVER-estimates the BRT. The two agree only if
-each subsystem can wait inside its own box until the others arrive, and the box
-is not control-invariant here: from the vx = 0.2 corner, px overshoots to ~0.28
-before theta can decelerate it. So this is a second over-approximation stacked
-on top of the shared_l2_control one below.
+Consequence for consumers: the min over time is now THEIRS to take. A v2
+consumer that takes only the max gets the BRS at a single t, not the BRT. The
+manifest renames the keys (v_sub_*_brt -> v_sub_*_brs) so that such a consumer
+fails loudly instead of silently changing meaning.
 
-Why clamp anyway: with TargetSetMode="none" the pure BRS is numerically
-unusable at this resolution. Its true range is [min l, max l] = [-0.2, 5.8],
-but odp's ghost-cell extrapolation at the outflow faces drives max |V| to 328
-by t = 3 s, and the exact minimum -0.2 drifts to -0.182. Doubling the theta and
-q extents (same dx) cuts that to 10.4 in the original window at ~10x the
-runtime — the boundary is confirmed as the driver, but it is still not a clean
-BRS. The clamp bounds the result exactly ([-0.2, 5.8] at every step, origin
-re-pinned to -0.2) at the cost of the ordering above. It masks the divergence
-rather than fixing it: treat V magnitudes near a domain face as unreliable.
+What the v2 clamp was hiding, and what replaced it
+--------------------------------------------------
+v2 justified the clamp with: "the true range is [min l, max l] = [-0.2, 5.8],
+but 'none' reaches max |V| = 328." That reference value is WRONG for a BRS.
 
-Note the clamp is LOSSY — the per-step BRS cannot be recovered from these
-arrays, so the exact ordering is not available downstream. Switch
-CFG["target_set_mode"] back to "none" (and fix the divergence) if you need it.
+V_BRS(x, t) = min_u l(x(0)) is the terminal cost at a state the trajectory has
+actually REACHED, and over t = 3 s these trajectories leave the grid by a wide
+margin — so V is not bounded above by max l over the grid. The bound is valid
+for a BRT, where V(x,t) <= l(x) by staying put, which is precisely why the
+clamped v2 solve satisfied it BY CONSTRUCTION and the check proved nothing.
+
+The correct a-priori bounds for a BRS are:
+
+    lower   V(z,t) >= min l = -r        globally valid, since
+                                        l = max_i|z_i| - r >= -r everywhere
+    upper   V(z,t) <= l(Phi_t^u(z))     for ANY admissible control u, because
+                                        the true V minimises over all of them
+
+Every subsystem here is a linear chain of integrators, so the flow under a
+CONSTANT control is a closed-form polynomial and that upper envelope costs
+nothing to evaluate over the whole grid. free_flow_upper_bound() sweeps a set
+of constant controls and keeps the pointwise min; value_bounds_report() then
+scores the solve against that envelope instead of against 5.8, separately
+inside and outside the DeepReach reporting window.
+
+Treat V magnitudes near a domain face as unreliable regardless: odp closes
+non-periodic boundaries with ghost-cell extrapolation, and switching the clamp
+off exposes that layer rather than removing it. The envelope is what tells you
+how far it has intruded.
 
 Time-axis convention (same as HJSolver / the 6D example):
     index  0 (first) = t = tmax
@@ -83,9 +101,9 @@ as the exact coupled value function.
 
 Output (written to --out_dir, default <repo root>/output_QuadrotorHover10D_decomposed/,
 alongside the other output_* dirs and covered by .gitignore's /output_* rule):
-  v_sub_x_brt.npy  — X BRT at all time steps, (npx, nvx, nth, nq, T)   ~1.4 GB
-  v_sub_y_brt.npy  — Y BRT at all time steps, (npy, nvy, nph, np_, T)  ~1.4 GB
-  v_sub_z_brt.npy  — Z BRT at all time steps, (npz, nvz, T)            ~3.2 MB
+  v_sub_x_brs.npy  — X BRS at all time steps, (npx, nvx, nth, nq, T)   ~1.4 GB
+  v_sub_y_brs.npy  — Y BRS at all time steps, (npy, nvy, nph, np_, T)  ~1.4 GB
+  v_sub_z_brs.npy  — Z BRS at all time steps, (npz, nvz, T)            ~3.2 MB
 (float64 on disk, though odp computes in float32 — HJSolver's all-time-steps
  buffer is a plain np.zeros(...). Halve the sizes by saving as float32.)
   artifact_manifest.json / metrics.json
@@ -126,8 +144,8 @@ CFG = {
     "small_number": 1e-5,
 
     # grids — units are SI: m, m/s, rad, rad/s
-    # v_sub_x_brt / v_sub_y_brt: 41^4 x T x 8 bytes ~= 1.4 GB each (T = 61)
-    # v_sub_z_brt:               81^2 x T x 8 bytes ~= 3.2 MB
+    # v_sub_x_brs / v_sub_y_brs: 41^4 x T x 8 bytes ~= 1.4 GB each (T = 61)
+    # v_sub_z_brs:               81^2 x T x 8 bytes ~= 3.2 MB
     "px_min": -6.0,  "px_max": 6.0,
     "vx_min": -2.5,  "vx_max": 2.5,
     "th_min": -0.3, "th_max": 0.3,     # theta [rad]
@@ -161,13 +179,26 @@ CFG = {
     # silently returns the target function at every time step. Guarded below.
     "accuracy": "medium",
 
-    # "minVWithV0" -> clamp min(V, l) every step -> per-subsystem BRT, bounded
-    # to [-0.2, 5.8]. "none" would give the per-step BRS the decomposition
-    # theory actually wants, but it diverges to max |V| = 328 here. Read the
-    # "BRT, NOT BRS" section of the module docstring before changing this: the
-    # two choices are not interchangeable, and this one over-estimates the BRT.
-    "target_set_mode": "minVWithV0",
+    # "none" -> no min(V, l) clamp -> the PER-STEP BRS that the decomposition
+    # theory requires. Do not switch this back to "minVWithV0" without also
+    # reverting the reconstruction: that mode bakes the min-over-time into each
+    # subsystem, which is the wrong operand order (max_i min_s instead of
+    # min_s max_i) and over-estimates the BRT. See the "PER-STEP BRS" section
+    # of the module docstring. The clamp is also LOSSY — the BRS cannot be
+    # recovered from clamped arrays, so the choice is made here or not at all.
+    "target_set_mode": "none",
     "u_mode": "min",     # reach
+
+    # DeepReach's state_test_range, i.e. the window these arrays are actually
+    # REPORTED on. The grid above deliberately overhangs it (3x in position,
+    # 1.7x in velocity, 1.2x in theta/phi) so the ghost-cell boundary layer has
+    # somewhere to live outside the reported region. Note q and p are NOT
+    # padded — they are the dims to watch in the bounds report below.
+    "report_window": {
+        "x": [[-2.0, 2.0], [-1.5, 1.5], [-0.25, 0.25], [-1.5, 1.5]],
+        "y": [[-2.0, 2.0], [-1.5, 1.5], [-0.25, 0.25], [-1.5, 1.5]],
+        "z": [[-2.0, 2.0], [-1.5, 1.5]],
+    },
 
     # NOTE — working precision is float32 and is NOT configurable from here.
     # odp hardcodes hcl.config.init_dtype = hcl.Float(32) in HJSolver, so the
@@ -315,6 +346,250 @@ def solve_z(c, tau):
 
 
 # ---------------------------------------------------------------------------
+# Subsystem descriptors — grid axes, reporting window, closed-form flow
+# ---------------------------------------------------------------------------
+#
+# Every subsystem is a chain of integrators driven by the control, so the flow
+# under a CONSTANT control u held for a duration t is a polynomial in t. The
+# expressions below are exact solutions of the ODE, not a discretisation:
+#
+#   X : px' = vx,  vx' = +g*theta,  theta' = q,  q' = u
+#   Y : py' = vy,  vy' = -g*phi,    phi'   = p,  p' = u    (X with g -> -g)
+#   Z : pz' = vz,  vz' = u
+#
+# They take the grid axes in broadcast shape and return the same, so one call
+# evaluates the flow over an entire subsystem grid.
+
+def _flow_pos_vel_ang(axes, t, u, g):
+    """Closed-form flow for the X/Y subsystems: (pos, vel, angle, rate)."""
+    p0, v0, a0, w0 = axes
+    w = w0 + u * t
+    a = a0 + w0 * t + u * t**2 / 2.0
+    v = v0 + g * (a0 * t + w0 * t**2 / 2.0 + u * t**3 / 6.0)
+    p = p0 + v0 * t + g * (a0 * t**2 / 2.0 + w0 * t**3 / 6.0 + u * t**4 / 24.0)
+    return (p, v, a, w)
+
+
+def _flow_double_integrator(axes, t, u, g):
+    """Closed-form flow for the Z subsystem: (pos, vel). g is unused."""
+    p0, v0 = axes
+    return (p0 + v0 * t + u * t**2 / 2.0, v0 + u * t)
+
+
+def make_spec(grid_min, grid_max, npts, window, flow, g):
+    """Bundle the grid axes, the reporting-window mask and the flow for one
+    subsystem, so the bound machinery below does not need to know which one it
+    is looking at.
+
+    `axes` are 1-D node coordinates; `axes_b` are the same reshaped to
+    broadcast against a full subsystem grid. `in_window` marks the cells that
+    lie inside DeepReach's state_test_range — everything outside it is padding
+    that exists to give the ghost-cell boundary layer somewhere to sit.
+    """
+    k = len(npts)
+    axes, axes_b, mask = [], [], None
+    for i in range(k):
+        a = np.linspace(grid_min[i], grid_max[i], npts[i])
+        shape = [1] * k
+        shape[i] = npts[i]
+        ab = a.reshape(shape)
+        axes.append(a)
+        axes_b.append(ab)
+        m = (ab >= window[i][0] - 1e-12) & (ab <= window[i][1] + 1e-12)
+        mask = m if mask is None else (mask & m)
+    return {
+        "axes": axes,
+        "axes_b": axes_b,
+        "in_window": np.broadcast_to(mask, tuple(npts)),
+        "flow": flow,
+        "g": g,
+    }
+
+
+# ---------------------------------------------------------------------------
+# A-priori value envelope
+# ---------------------------------------------------------------------------
+
+def free_flow_upper_bound(spec, t, r, u_max, n_candidates=9):
+    """Pointwise UPPER bound on the per-step BRS value at horizon t.
+
+    V_BRS(z, t) = min over ALL admissible controls of l(z(0)). Any particular
+    admissible control therefore gives an upper bound, and the min over a
+    family of them gives a tighter one. Here the family is constant controls
+    sampled across [-u_max, u_max], for which the flow is closed-form.
+
+    This is a genuine certificate, not a heuristic: whatever the solver
+    reports above this envelope is numerical error, with no appeal.
+
+    It is only an upper bound — a solve sitting comfortably below it is not
+    thereby correct. Its job is to replace the v2 reference value of max l over
+    the grid (5.8), which is a valid bound for a BRT but NOT for a BRS, since a
+    BRS trajectory is free to leave the grid before the terminal cost is read.
+    """
+    best = None
+    for u in np.linspace(-u_max, u_max, n_candidates):
+        z = spec["flow"](spec["axes_b"], t, u, spec["g"])
+        l = np.abs(z[0])
+        for zi in z[1:]:
+            l = np.maximum(l, np.abs(zi))
+        l = l - r
+        best = l if best is None else np.minimum(best, l)
+    return np.broadcast_to(best, spec["in_window"].shape)
+
+
+def value_bounds_report(v_all, spec, tau, r, u_max, tol=1e-5, rel_tol=0.10):
+    """Score a per-step BRS solve against bounds that are actually valid for it.
+
+        lower   V(z,t) >= -r                 l = max_i|z_i| - r >= -r globally
+        upper   V(z,t) <= free-flow envelope  see free_flow_upper_bound()
+
+    Reported separately over the full grid and over the DeepReach reporting
+    window, because the two answer different questions. Exceedance on the full
+    grid says the ghost-cell layer is active somewhere; exceedance INSIDE the
+    window says it has reached the region anyone will actually read, which is
+    the number that decides whether the padding is sufficient.
+
+    Also traces the violation against horizon and derives `trusted_horizon`:
+    the longest t up to which the in-window violation stays under `rel_tol` of
+    the envelope. The boundary layer grows with horizon, so short horizons stay
+    clean long after the full one has gone — which makes this far more useful
+    than a single pass/fail over the whole run.
+
+    Time-axis convention: index j holds horizon tau[T-1-j], so index 0 is tmax
+    and index -1 is t = 0.
+    """
+    T = v_all.shape[-1]
+    win = spec["in_window"]
+    out = {
+        "v_min": np.inf, "v_max": -np.inf,
+        "v_min_window": np.inf, "v_max_window": -np.inf,
+        "envelope_max": -np.inf,
+        "over_envelope": 0.0, "over_envelope_window": 0.0,
+        "under_lower": 0.0, "under_lower_window": 0.0,
+        "worst_over_window_t": None,
+        "profile": [],
+    }
+    for j in range(T):
+        t = float(tau[T - 1 - j])
+        env = free_flow_upper_bound(spec, t, r, u_max)
+        v = v_all[..., j]
+        vw = v[win]
+
+        out["v_min"] = min(out["v_min"], float(v.min()))
+        out["v_max"] = max(out["v_max"], float(v.max()))
+        out["v_min_window"] = min(out["v_min_window"], float(vw.min()))
+        out["v_max_window"] = max(out["v_max_window"], float(vw.max()))
+        out["envelope_max"] = max(out["envelope_max"], float(env.max()))
+
+        over = v - env
+        out["over_envelope"] = max(out["over_envelope"], float(over.max()))
+        ow = float(over[win].max())
+        if ow > out["over_envelope_window"]:
+            out["over_envelope_window"] = ow
+            out["worst_over_window_t"] = t
+
+        out["under_lower"] = max(out["under_lower"], float(-r - v.min()))
+        out["under_lower_window"] = max(out["under_lower_window"], float(-r - vw.min()))
+
+        env_w = max(float(env[win].max()), 1.0)   # floor: t=0 envelope is small
+        out["profile"].append({
+            "t": t,
+            "over_window": max(0.0, ow),
+            "over_window_rel": max(0.0, ow) / env_w,
+        })
+
+    # Longest clean prefix of horizons, in increasing t.
+    trusted = 0.0
+    for p in sorted(out["profile"], key=lambda d: d["t"]):
+        if p["over_window_rel"] > rel_tol:
+            break
+        trusted = p["t"]
+    out["trusted_horizon"] = trusted
+    out["trusted_horizon_rel_tol"] = rel_tol
+
+    out["lower_bound"] = float(-r)
+    out["within_bounds"] = bool(
+        out["over_envelope"] <= tol and out["under_lower"] <= tol)
+    out["within_bounds_window"] = bool(
+        out["over_envelope_window"] <= tol and out["under_lower_window"] <= tol)
+    for k in ("over_envelope", "over_envelope_window", "under_lower",
+              "under_lower_window"):
+        out[k] = max(0.0, out[k])
+    return out
+
+
+# ---------------------------------------------------------------------------
+# Reconstruction  (Chen et al. 2018, Prop. 1 + 4 — correct operand order)
+# ---------------------------------------------------------------------------
+
+def reconstruct_brt_pointwise(states, v_x_all, v_y_all, v_z_all, c):
+    """Evaluate the full 10D BRT at arbitrary states, without a 10D grid.
+
+        BRS at index j :  max_i V_i(x_i, j)
+        BRT at index j :  min_{s <= t_j} max_i V_i(x_i, s)  =  min over k >= j
+
+    The max is taken FIRST, per time step, and only then the min over time —
+    that operand order is the whole point of this revision, and it is why the
+    subsystems must be stored as per-step BRS rather than per-subsystem BRTs.
+
+    Index j = 0 is t = tmax and j = -1 is t = 0, so the horizons at or below
+    t_j are exactly the indices k >= j, and a reverse cumulative min realises
+    the union over time.
+
+    Args:
+        states : (N, 10) array in the DeepReach state order
+                 (px, vx, theta, q, py, vy, phi, p, pz, vz)
+        v_*_all: the per-step BRS arrays as saved by main()
+        c      : CFG
+
+    Returns:
+        (N, T) array — the BRT at every time index. Slice [:, 0] for the full
+        horizon. Query points outside a subsystem grid are extrapolated
+        linearly by the interpolator; they are outside the reporting window by
+        construction, so treat them as unreliable.
+    """
+    try:
+        from scipy.interpolate import RegularGridInterpolator
+    except ImportError as exc:                                # pragma: no cover
+        raise ImportError(
+            "reconstruct_brt_pointwise needs scipy (it is in environment.yml). "
+            "The solve itself does not."
+        ) from exc
+
+    states = np.asarray(states, dtype=np.float64)
+    if states.ndim != 2 or states.shape[1] != 10:
+        raise ValueError(f"expected states of shape (N, 10), got {states.shape}")
+
+    subsystems = [
+        (v_x_all, [0, 1, 2, 3],
+         [c["px_min"], c["vx_min"], c["th_min"], c["q_min"]],
+         [c["px_max"], c["vx_max"], c["th_max"], c["q_max"]],
+         [c["npx"], c["nvx"], c["nth"], c["nq"]]),
+        (v_y_all, [4, 5, 6, 7],
+         [c["py_min"], c["vy_min"], c["ph_min"], c["p_min"]],
+         [c["py_max"], c["vy_max"], c["ph_max"], c["p_max"]],
+         [c["npy"], c["nvy"], c["nph"], c["np"]]),
+        (v_z_all, [8, 9],
+         [c["pz_min"], c["vz_min"]],
+         [c["pz_max"], c["vz_max"]],
+         [c["npz"], c["nvz"]]),
+    ]
+
+    v_max = None
+    for arr, idx, lo, hi, npts in subsystems:
+        axes = tuple(np.linspace(lo[i], hi[i], npts[i]) for i in range(len(npts)))
+        # Trailing time axis is carried through as a value vector, so one call
+        # returns every time step at once: (N, T).
+        interp = RegularGridInterpolator(
+            axes, arr, method="linear", bounds_error=False, fill_value=None)
+        vi = interp(states[:, idx])
+        v_max = vi if v_max is None else np.maximum(v_max, vi)
+
+    # min over k >= j  ==  reverse cumulative min along the time axis
+    return np.minimum.accumulate(v_max[:, ::-1], axis=1)[:, ::-1]
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
@@ -418,37 +693,6 @@ def self_symmetry_report(v_all):
     return {"max": max_err, "peak_abs_v": peak_v}
 
 
-def value_bounds_report(v_all, l_min, l_max, tol=1e-5):
-    """Check V against its a-priori range [min l, max l].
-
-    Both the BRS (min_u l(x(t))) and the BRT (min over s of that) are values OF
-    the terminal cost along some trajectory, so neither can leave the range of
-    l itself. Anything outside is numerical error, full stop — which makes this
-    the cheapest honest health check on the solve.
-
-    It is what separates the two failure modes seen here: with
-    TargetSetMode="minVWithV0" the clamp pins the range to exactly [min l,
-    max l], while with "none" odp's ghost-cell extrapolation at the outflow
-    faces pushes max |V| to ~328 against a true max of 5.8. Note that PASSING
-    this check under the clamp proves very little — the clamp enforces the
-    bound by construction and hides whatever the evolution did underneath.
-    """
-    vmin, vmax = np.inf, -np.inf
-    for i in range(v_all.shape[-1]):
-        v_t = v_all[..., i]
-        vmin = min(vmin, float(v_t.min()))
-        vmax = max(vmax, float(v_t.max()))
-    return {
-        "min": vmin,
-        "max": vmax,
-        "l_min": float(l_min),
-        "l_max": float(l_max),
-        "within_bounds": bool(vmin >= l_min - tol and vmax <= l_max + tol),
-        "overshoot": max(0.0, vmax - l_max),
-        "undershoot": max(0.0, l_min - vmin),
-    }
-
-
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
@@ -476,52 +720,95 @@ def main(out_dir: str):
     print(f"Time steps T = {T}  (tmax={c['tmax']} s, dt={c['dt']} s)")
 
     # -- X subsystem ---------------------------------------------------------
-    print("\nSolving X subsystem  [px, vx, theta, q]  (BRT) ...")
+    print("\nSolving X subsystem  [px, vx, theta, q]  (per-step BRS) ...")
     t0 = time.time()
     v_x_all = solve_x(c, tau)
     t_x = time.time() - t0
     print(f"  shape : {v_x_all.shape}   time : {t_x:.1f}s")
-    print(f"  BRT volume at tmax (V<0): {(v_x_all[..., 0] < 0).mean():.4f}")
+    print(f"  BRS volume at tmax (V<0): {(v_x_all[..., 0] < 0).mean():.4f}")
 
     # -- Y subsystem ---------------------------------------------------------
-    print("\nSolving Y subsystem  [py, vy, phi, p]  (BRT) ...")
+    print("\nSolving Y subsystem  [py, vy, phi, p]  (per-step BRS) ...")
     t0 = time.time()
     v_y_all = solve_y(c, tau)
     t_y = time.time() - t0
     print(f"  shape : {v_y_all.shape}   time : {t_y:.1f}s")
-    print(f"  BRT volume at tmax (V<0): {(v_y_all[..., 0] < 0).mean():.4f}")
+    print(f"  BRS volume at tmax (V<0): {(v_y_all[..., 0] < 0).mean():.4f}")
 
     # -- Z subsystem ---------------------------------------------------------
-    print("\nSolving Z subsystem  [pz, vz]  (BRT) ...")
+    print("\nSolving Z subsystem  [pz, vz]  (per-step BRS) ...")
     t0 = time.time()
     v_z_all = solve_z(c, tau)
     t_z = time.time() - t0
     print(f"  shape : {v_z_all.shape}   time : {t_z:.1f}s")
-    print(f"  BRT volume at tmax (V<0): {(v_z_all[..., 0] < 0).mean():.4f}")
+    print(f"  BRS volume at tmax (V<0): {(v_z_all[..., 0] < 0).mean():.4f}")
 
     # -- Sanity check: a-priori value bounds ---------------------------------
-    # ShapeRectangle is max_i(|x_i| - r), so over the grid it runs from -r (at
-    # the origin, which is a node since every axis is symmetric with an odd
-    # point count) up to (largest half-extent) - r.
-    l0_max = max(c["px_max"], c["vx_max"], c["th_max"], c["q_max"]) - c["target_radius"]
-    l0_min = -c["target_radius"]
-    bounds = {
-        "x": value_bounds_report(v_x_all, l0_min, l0_max),
-        "y": value_bounds_report(v_y_all, l0_min, l0_max),
-        "z": value_bounds_report(
-            v_z_all, l0_min,
-            max(c["pz_max"], c["vz_max"]) - c["target_radius"]),
+    # No clamp is active any more, so this is a real check rather than a
+    # tautology: the lower bound is the global min of l, and the upper bound is
+    # the closed-form free-flow envelope. See free_flow_upper_bound() for why
+    # the v2 reference value (max l over the grid) does not apply to a BRS.
+    r = c["target_radius"]
+    w = c["report_window"]
+    specs = {
+        "x": make_spec(
+            [c["px_min"], c["vx_min"], c["th_min"], c["q_min"]],
+            [c["px_max"], c["vx_max"], c["th_max"], c["q_max"]],
+            [c["npx"], c["nvx"], c["nth"], c["nq"]],
+            w["x"], _flow_pos_vel_ang, +c["gravity"]),
+        "y": make_spec(
+            [c["py_min"], c["vy_min"], c["ph_min"], c["p_min"]],
+            [c["py_max"], c["vy_max"], c["ph_max"], c["p_max"]],
+            [c["npy"], c["nvy"], c["nph"], c["np"]],
+            w["y"], _flow_pos_vel_ang, -c["gravity"]),
+        "z": make_spec(
+            [c["pz_min"], c["vz_min"]],
+            [c["pz_max"], c["vz_max"]],
+            [c["npz"], c["nvz"]],
+            w["z"], _flow_double_integrator, 0.0),
     }
-    print(f"\nValue bounds (V must stay within the range of l — anything outside "
-          f"is pure numerical error):")
+    bounds = {
+        "x": value_bounds_report(v_x_all, specs["x"], tau, r, c["u_max"]),
+        "y": value_bounds_report(v_y_all, specs["y"], tau, r, c["u_max"]),
+        "z": value_bounds_report(v_z_all, specs["z"], tau, r, c["u_max"]),
+    }
+    print("\nValue bounds — V must lie in [-r, free-flow envelope]; anything "
+          "outside is numerical error:")
     for k, b in bounds.items():
-        flag = "ok" if b["within_bounds"] else "OUT OF BOUNDS"
-        print(f"  {k}: [{b['min']:+.4f}, {b['max']:+.4f}]  vs l = "
-              f"[{b['l_min']:+.4f}, {b['l_max']:+.4f}]   {flag}")
-    if all(b["within_bounds"] for b in bounds.values()):
-        print("  (bounded BY CONSTRUCTION under TargetSetMode="
-              f"{c['target_set_mode']!r} — the clamp enforces this, so it says "
-              "nothing about the quality of the evolution underneath)")
+        print(f"  {k}: full grid   V in [{b['v_min']:+.4f}, {b['v_max']:+.4f}]"
+              f"   envelope max {b['envelope_max']:+.4f}"
+              f"   over by {b['over_envelope']:.4f}"
+              f"   {'ok' if b['within_bounds'] else 'OUT OF BOUNDS'}")
+        print(f"     report window V in [{b['v_min_window']:+.4f}, "
+              f"{b['v_max_window']:+.4f}]"
+              f"   over by {b['over_envelope_window']:.4f}"
+              f"   {'ok' if b['within_bounds_window'] else 'OUT OF BOUNDS'}"
+              + (f"   (worst at t = {b['worst_over_window_t']:.2f}s)"
+                 if b["worst_over_window_t"] is not None else ""))
+    print("  The window row is the one that decides whether the grid padding is "
+          "enough: it asks whether the boundary layer reached the region "
+          "DeepReach actually reads.")
+
+    # -- Verdict: how far out in horizon is this solve actually usable? -------
+    # Removing the v2 clamp buys the correct operand order and costs the bound
+    # the clamp was providing. The boundary layer is now visible, it grows with
+    # horizon, and padding the grid does not cure it (measured: doubling the
+    # theta/q extents AND the px/vx extents, 14.5x the cells, only moves the
+    # worst in-window violation from ~12 to ~4.7). So the honest output is a
+    # horizon up to which the values are trustworthy, not a global pass/fail.
+    trusted = min(b["trusted_horizon"] for b in bounds.values())
+    worst = min(bounds, key=lambda k: bounds[k]["trusted_horizon"])
+    print(f"\nTrusted horizon: t <= {trusted:.2f}s  (of tmax = {c['tmax']}s; "
+          f"limited by the {worst.upper()} subsystem, at "
+          f"{bounds[worst]['trusted_horizon_rel_tol']*100:.0f}% of the envelope)")
+    if trusted < c["tmax"] - 1e-9:
+        print(f"  WARNING: beyond t = {trusted:.2f}s the in-window value "
+              f"MAGNITUDES are unreliable. The zero level set degrades more "
+              f"slowly than the magnitudes, so the BRT may still be usable — "
+              f"but do not report V itself past this horizon without checking.")
+        print(f"  This is the cost of the correct operand order: v2's "
+              f"min(V, l) clamp bounded the magnitudes at the price of "
+              f"computing max_i min_s instead of min_s max_i.")
 
     # -- Sanity check: X/Y mirror symmetry -----------------------------------
     # Read this together with the X self-symmetry below: the mirror number is
@@ -531,7 +818,7 @@ def main(out_dir: str):
     print("\nX self-symmetry  |Vx(x) - Vx(-x)|   (one solve, exact in theory):")
     print(f"  max           = {self_sym['max']:.3e}")
     print(f"  peak |Vx|     = {self_sym['peak_abs_v']:.3e}   "
-          f"(target function maxes out at {l0_max:.2f})")
+          f"(free-flow envelope maxes out at {bounds['x']['envelope_max']:.2f})")
 
     mirror = mirror_symmetry_report(v_x_all, v_y_all)
     if mirror is None:
@@ -544,7 +831,7 @@ def main(out_dir: str):
               f"({mirror['interior_peel_cells']} cells peeled off each spatial dim)")
         print(f"  mean          = {mirror['mean']:.3e}")
         print(f"  sign mismatch = {mirror['sign_mismatch']*100:.4f}% of cells   "
-              f"<- the one that matters; the BRT only sees sign(V)")
+              f"<- the one that matters; the BRS/BRT only sees sign(V)")
         if mirror["max"] <= 4.0 * self_sym["max"]:
             print("  => same order as the X self-symmetry: this is the ENO/boundary "
                   "scheme, not an X-vs-Y dynamics error.")
@@ -555,9 +842,9 @@ def main(out_dir: str):
     # single-precision values, and the on-disk dtype is decided here and nowhere
     # else — adding .astype(np.float32) would halve the files to ~690 MB without
     # losing anything the solver actually computed.
-    for fname, arr in [("v_sub_x_brt.npy", v_x_all),
-                       ("v_sub_y_brt.npy", v_y_all),
-                       ("v_sub_z_brt.npy", v_z_all)]:
+    for fname, arr in [("v_sub_x_brs.npy", v_x_all),
+                       ("v_sub_y_brs.npy", v_y_all),
+                       ("v_sub_z_brs.npy", v_z_all)]:
         p = os.path.join(out_dir, fname)
         np.save(p, arr)
         print(f"Saved {fname:18s} shape={str(arr.shape):28s} "
@@ -568,47 +855,53 @@ def main(out_dir: str):
     # than the one holding the arrays (see odp_10d.sh).
     root = os.path.abspath(out_dir)
     manifest = {
-        # version 2: arrays switched from per-step BRS (TargetSetMode="none")
-        # to per-subsystem BRT ("minVWithV0"), and the keys/filenames went from
-        # v_sub_*_brs to v_sub_*_brt. A consumer written against version 1 will
-        # not find the old keys — that is intentional, because the CONTENTS
-        # changed meaning and silently reusing the old names would hide it.
-        "version": 2,
+        # version 3: arrays switched BACK from per-subsystem BRT
+        # ("minVWithV0", v2) to per-step BRS (TargetSetMode="none"), because v2
+        # reconstructed in the wrong operand order. Keys/filenames go from
+        # v_sub_*_brt to v_sub_*_brs. A v2 consumer will not find its keys —
+        # that is intentional: it would otherwise keep taking the max alone and
+        # silently return a BRS where it used to get a BRT.
+        "version": 3,
         "root": root,
         "system": "QuadrotorHover10D",
         "control_config": "shared_l2_control",
-        "value_semantics": "per_subsystem_brt",
+        "value_semantics": "per_step_brs",
         "target_set_mode": c["target_set_mode"],
+        "report_window": c["report_window"],
+        "report_window_note": "DeepReach state_test_range. The grid overhangs "
+                              "it so the ghost-cell boundary layer has somewhere "
+                              "to sit outside the reported region; q and p are "
+                              "NOT padded.",
         "values": {
-            "v_sub_x_brt": {
-                "path": os.path.join(root, "v_sub_x_brt.npy"),
+            "v_sub_x_brs": {
+                "path": os.path.join(root, "v_sub_x_brs.npy"),
                 "shape": list(v_x_all.shape),
                 "dtype": str(v_x_all.dtype),
                 "axes": ["px", "vx", "theta", "q", "time"],
                 "state_idx": [0, 1, 2, 3],
                 "grid_min": [c["px_min"], c["vx_min"], c["th_min"], c["q_min"]],
                 "grid_max": [c["px_max"], c["vx_max"], c["th_max"], c["q_max"]],
-                "note": "X subsystem BRT at each time step (min(V, l) clamped every step)",
+                "note": "X subsystem BRS at each time step (no clamping)",
             },
-            "v_sub_y_brt": {
-                "path": os.path.join(root, "v_sub_y_brt.npy"),
+            "v_sub_y_brs": {
+                "path": os.path.join(root, "v_sub_y_brs.npy"),
                 "shape": list(v_y_all.shape),
                 "dtype": str(v_y_all.dtype),
                 "axes": ["py", "vy", "phi", "p", "time"],
                 "state_idx": [4, 5, 6, 7],
                 "grid_min": [c["py_min"], c["vy_min"], c["ph_min"], c["p_min"]],
                 "grid_max": [c["py_max"], c["vy_max"], c["ph_max"], c["p_max"]],
-                "note": "Y subsystem BRT at each time step (min(V, l) clamped every step)",
+                "note": "Y subsystem BRS at each time step (no clamping)",
             },
-            "v_sub_z_brt": {
-                "path": os.path.join(root, "v_sub_z_brt.npy"),
+            "v_sub_z_brs": {
+                "path": os.path.join(root, "v_sub_z_brs.npy"),
                 "shape": list(v_z_all.shape),
                 "dtype": str(v_z_all.dtype),
                 "axes": ["pz", "vz", "time"],
                 "state_idx": [8, 9],
                 "grid_min": [c["pz_min"], c["vz_min"]],
                 "grid_max": [c["pz_max"], c["vz_max"]],
-                "note": "Z subsystem BRT at each time step (min(V, l) clamped every step)",
+                "note": "Z subsystem BRS at each time step (no clamping)",
             },
         },
         "time": {
@@ -626,37 +919,70 @@ def main(out_dir: str):
             "full_grid_materialized": False,
             "reason": "full 10D grid is 41^4 * 41^4 * 81^2 ~= 5.2e16 cells per "
                       "time step; evaluate on demand instead",
-            "method": "Proposition 1 + 4, Chen et al. 2018 (max over subsystems, per time step)",
-            "formula_brt": "V10D_BRT(x, t) = max(interp(v_sub_x_brt, x[0:4], t), "
-                           "interp(v_sub_y_brt, x[4:8], t), "
-                           "interp(v_sub_z_brt, x[8:10], t))",
-            "formula_note": "Take the max ONLY -- do NOT apply a further min over "
-                            "time. The min-over-time is already baked into each "
-                            "array by TargetSetMode='minVWithV0'.",
+            "method": "Proposition 1 + 4, Chen et al. 2018 (max over subsystems per "
+                      "time step, THEN min over time)",
+            "formula_brs": "V10D_BRS(x, t_j) = max(interp(v_sub_x_brs, x[0:4], j), "
+                           "interp(v_sub_y_brs, x[4:8], j), "
+                           "interp(v_sub_z_brs, x[8:10], j))",
+            "formula_brt": "V10D_BRT(x, t_j) = min over k >= j of V10D_BRS(x, t_k)",
+            "formula_note": "The max comes FIRST, per time step; the min over time is "
+                            "applied to the reconstructed 10D value, NOT inside each "
+                            "subsystem. Taking the max alone (the v2 recipe) now yields "
+                            "the BRS at a single t, not the BRT. Index 0 = tmax and "
+                            "index -1 = t = 0, so the horizons at or below t_j are the "
+                            "indices k >= j; a reverse cumulative min realises the union "
+                            "over time. Reference implementation: "
+                            "reconstruct_brt_pointwise() in the generating script.",
             "exact": False,
-            "exactness_note": "TWO stacked over-approximations of the BRT. "
-                              "(1) shared_l2_control: each subsystem uses the projected "
-                              "interval [-u_max, u_max], whose product box strictly "
-                              "contains the L2 ball. "
-                              "(2) ordering: these arrays are per-subsystem BRTs, so the "
-                              "reconstruction computes max_i min_s V_i, whereas the exact "
-                              "BRT is min_s max_i V_i^BRS. Since max_i min_s <= min_s max_i, "
-                              "the result lower-bounds the true coupled value. Equality "
-                              "would require each subsystem to be able to wait inside its "
-                              "own target box, and that box is not control-invariant here.",
-            "brs_available": False,
-            "brs_note": "The per-step BRS needed for the exact ordering is NOT recoverable "
-                        "from these arrays -- the min(V, l) clamp is lossy. Re-run with "
-                        "TargetSetMode='none' to get it, but note that mode diverges to "
-                        "max|V| = 328 (true range [-0.2, 5.8]) at this resolution.",
+            "exactness_note": "ONE over-approximation remains, down from two in v2. "
+                              "(1) shared_l2_control: each subsystem is solved over the "
+                              "projected interval [-u_max, u_max], whose product box "
+                              "strictly contains the L2 ball, so the reconstruction "
+                              "over-estimates the BRT of the true coupled system and "
+                              "lower-bounds its value. This is irreducible by "
+                              "decomposition and is the gap the joint DeepReach model "
+                              "exists to close. "
+                              "(2) ordering: FIXED in v3. The arrays are per-step BRS and "
+                              "the formula above computes min_s max_i, which is the exact "
+                              "Prop 1 + 4 reconstruction for the relaxed (box-control) "
+                              "system. v2 stored per-subsystem BRTs and computed "
+                              "max_i min_s <= min_s max_i, an extra over-approximation.",
+            "brs_available": True,
+            "brs_note": "These arrays ARE the per-step BRS. Because no min(V, l) clamp is "
+                        "applied, the ghost-cell boundary layer is visible rather than "
+                        "masked -- see validation.value_bounds, which scores the solve "
+                        "against a closed-form free-flow envelope separately inside and "
+                        "outside the reporting window.",
         },
         "validation": {
             "value_bounds": bounds,
-            "value_bounds_identity": "min(l) <= V(x, t) <= max(l) for every t",
-            "value_bounds_note": "Satisfied by construction under "
-                                 "TargetSetMode='minVWithV0'; it does NOT certify the "
-                                 "evolution. Under 'none' the same solve reaches "
-                                 "max|V| = 328 against a true max of 5.8.",
+            "trusted_horizon": trusted,
+            "trusted_horizon_note": "Longest horizon for which the in-window "
+                                    "violation of the free-flow envelope stays under "
+                                    "10% of that envelope, minimised over subsystems. "
+                                    "Past it, treat in-window V MAGNITUDES as "
+                                    "unreliable; the zero level set degrades more "
+                                    "slowly. Grid padding does not cure this -- "
+                                    "measured, 14.5x the cells moved the worst "
+                                    "in-window violation only from ~12 to ~4.7 -- "
+                                    "because over this horizon the characteristics "
+                                    "cross the whole domain, so the truncated-domain "
+                                    "BRS genuinely depends on data off the grid.",
+            "value_bounds_identity": "-r <= V(z, t) <= min over constant u of "
+                                     "l(Phi_t^u(z)) for every t",
+            "value_bounds_note": "With no clamp active this is a real check, not a "
+                                 "tautology. Lower bound: l = max_i|z_i| - r >= -r "
+                                 "globally. Upper bound: the true BRS minimises over all "
+                                 "controls, so ANY admissible control gives a valid "
+                                 "upper bound; the envelope sweeps constant controls, for "
+                                 "which these integrator chains have closed-form flow. "
+                                 "NOTE the v2 bound (max l over the grid = 5.8) is valid "
+                                 "for a BRT, where V(x,t) <= l(x) by staying put, but NOT "
+                                 "for a BRS, whose trajectory leaves the grid before the "
+                                 "terminal cost is read -- so '328 vs 5.8' overstated the "
+                                 "divergence. The *_window fields are the ones that "
+                                 "matter: they say whether the boundary layer reached the "
+                                 "region DeepReach reads.",
             "xy_mirror": mirror,
             "xy_mirror_identity": "Vy(py,vy,phi,p,t) == Vx(py,vy,-phi,-p,t)",
             "x_self_symmetry": self_sym,
@@ -700,8 +1026,9 @@ def main(out_dir: str):
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
-        description="Run decomposed QuadrotorHover10D BRT solver "
-                    "(X 4D + Y 4D + Z 2D; no full 10D grid)"
+        description="Run decomposed QuadrotorHover10D per-step BRS solver "
+                    "(X 4D + Y 4D + Z 2D; no full 10D grid). Reconstruct the "
+                    "BRT downstream as min-over-time of max-over-subsystems."
     )
     parser.add_argument(
         "--out_dir",
