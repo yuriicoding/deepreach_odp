@@ -24,13 +24,17 @@ INDEPENDENCE NOTE:
   Translation [px, py, vx, vy] uses [Fx, Fy]; rotation [theta, omega] uses [tau].
   No shared state or control → full 6D BRAT reconstruction is EXACT (Prop 1 + Prop 4,
   Chen et al. 2018). The reconstruct_brat_6d helper below is correct but infeasible
-  at paper resolution (full 6D array would be ~509 GB); evaluate V6D on demand as
+  at this resolution (full 6D array would be ~83 TB); evaluate V6D on demand as
   max(interp(V_trans, x_trans, t), interp(V_rot, x_rot, t)).
 
-Output (written to --out_dir, default ./output_SpacecraftDocking6D_decomposed/):
-  v_trans_brs.npy  — translation BRAS at all time steps, (npx, npy, nvx, nvy, T) ~210 MB
-  v_rot_brs.npy    — rotation    BRS  at all time steps, (nth, nom, T)             ~0.2 MB
-  v_brat_all.npy   — full 6D BRAT at all time steps,    (npx,npy,nvx,nvy,nth,nom,T) ~257 GB
+Only the two subsystem value functions are written to disk — the full 6D BRAT is
+never materialised, and no |V_trans - V_rot| gap array is produced.
+
+Output (written to --out_dir, default <repo root>/output_SpacecraftDocking6D_decomposed/,
+alongside the other output_* dirs and covered by .gitignore's /output_* rule):
+  v_trans_brs.npy  — translation BRAS at all time steps, (npx, npy, nvx, nvy, T) ~1.6 GB
+  v_rot_brs.npy    — rotation    BRS  at all time steps, (nth, nom, T)            ~21 MB
+  artifact_manifest.json / metrics.json
 """
 
 import argparse
@@ -58,6 +62,11 @@ _W_C = 1.0                           # chaser width  [m]
 _H_C = 1.0                           # chaser height [m]
 _RC  = math.sqrt(_W_C**2 + _H_C**2) / 2   # bounding-circle radius = sqrt(2)/2 ≈ 0.7071 m
 
+# Default output lives at the repo root, not next to this file, so the path does
+# not depend on the directory the script happens to be launched from.
+_REPO_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_OUT_DIR = os.path.join(_REPO_ROOT, "output_SpacecraftDocking6D_decomposed")
+
 _POST_LENGTH      = 0.2              # docking post length [m]
 _GOAL_CLEARANCE   = 0.143           # goal top is 7 mm inside inflated post boundary [m]
 _GOAL_BAND_HEIGHT = 0.2              # goal band height [m]
@@ -70,22 +79,21 @@ _GOAL_Y_MIN = _GOAL_Y_MAX - _GOAL_BAND_HEIGHT           # = -1.400 m
 CFG = {
     # time — matches DeepReach training horizon
     "tmax": 10.0,
-    "dt": 0.3,
+    "dt": 0.1,
     "small_number": 1e-5,
 
-    # grids — 35 pts per dimension across all subsystems
-    # v_trans_brs shape: 35^4 × T × 4 bytes ≈ 210 MB
-    # v_rot_brs   shape: 35^2 × T × 4 bytes ≈ 0.17 MB
-    # v_brat_all  shape: 35^6 × T × 4 bytes ≈ 257 GB  (full 6D reconstruction, T=35)
+    # grids — dense resolution; only the subsystem arrays are stored
+    # v_trans_brs shape: (91, 101, 21, 21, T) × 4 bytes ≈ 1.6 GB   (T=101)
+    # v_rot_brs   shape: (361, 141, T)        × 4 bytes ≈ 21 MB
     "px_min": -15.0, "px_max": 15.0,
     "py_min": -15.0, "py_max": 15.0,
     "vx_min":  -1.5, "vx_max":  1.5,
     "vy_min":  -2.0, "vy_max":  2.0,
-    "npx": 35, "npy": 35, "nvx": 35, "nvy": 35,
+    "npx": 91, "npy": 101, "nvx": 21, "nvy": 21,
 
     "th_min": -math.pi, "th_max": math.pi,
     "om_min":  -1.0,    "om_max":  1.0,
-    "nth": 35, "nom": 35,
+    "nth": 361, "nom": 141,
 
     # spacecraft parameters — match paper code
     "n": _N,             # mean motion [rad/s], computed from 400 km LEO
@@ -344,7 +352,7 @@ def solve_rot(c, tau):
 
 
 # ---------------------------------------------------------------------------
-# Reconstruction and gap
+# Reconstruction (reference only — never called at this resolution)
 # ---------------------------------------------------------------------------
 
 def reconstruct_brat_6d(v_trans_all, v_rot_all):
@@ -391,137 +399,6 @@ def reconstruct_brat_6d(v_trans_all, v_rot_all):
     return brat_all   # (npx, npy, nvx, nvy, nth, nom, T)
 
 
-def save_brat_memmap(v_trans_all, v_rot_all, out_path):
-    """Reconstruct full 6D BRAT and write it to disk one px-slice at a time.
-
-    Same logic as reconstruct_brat_6d (Proposition 1 + 4, Chen et al. 2018),
-    and produces byte-for-byte the same values — just streamed to disk.
-
-    The running-min-over-time (BRAT = level-set union of BRAS over the horizon)
-    is a per-cell reduction along the time axis, so it decomposes EXACTLY over
-    spatial blocks: iterate over px (outermost spatial dim) and take a reverse
-    cumulative-min along time within each slice. This keeps only ~15 GB in RAM
-    (one (npy,nvx,nvy,nth,nom,T) slice plus its accumulate temp) instead of the
-    full (npx,npy,nvx,nvy,nth,nom,T) array (~257 GB).
-
-    Output layout is T-LAST — (npx, npy, nvx, nvy, nth, nom, T) — matching
-    v_trans_brs / v_rot_brs / close_value_gap_all and every downstream reader
-    (DeepReach dataio, inference, comparison). Time index 0 = tmax, index -1 =
-    t = 0, same as HJSolver. Each out[px_idx] write is a contiguous C-layout
-    block, so no strided scatter.
-
-    Args:
-        v_trans_all : (npx, npy, nvx, nvy, T)
-        v_rot_all   : (nth, nom, T)
-        out_path    : destination .npy path (written as memmap)
-
-    Returns:
-        np.memmap view of the saved array, shape (npx, npy, nvx, nvy, nth, nom, T)
-    """
-    T                   = v_trans_all.shape[-1]
-    npx, npy, nvx, nvy  = v_trans_all.shape[:4]
-    nth, nom            = v_rot_all.shape[:2]
-
-    shape   = (npx, npy, nvx, nvy, nth, nom, T)
-    size_gb = int(np.prod(shape)) * 4 / 1e9
-    print(f"  shape={shape}  {size_gb:.1f} GB  → {out_path}")
-
-    brat_mm = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=shape)
-    vr_f32  = v_rot_all.astype(np.float32)   # (nth, nom, T)
-
-    for px_idx in range(npx):
-        # BRAS(t) at this px slice = max(V_trans, V_rot) lifted to 6D, all t.
-        vt_px = v_trans_all[px_idx].astype(np.float32)   # (npy, nvx, nvy, T)
-        bras = np.maximum(
-            vt_px[:, :, :, np.newaxis, np.newaxis, :],           # (npy,nvx,nvy,1,1,T)
-            vr_f32[np.newaxis, np.newaxis, np.newaxis, :, :, :],  # (1,1,1,nth,nom,T)
-        )                                                         # (npy,nvx,nvy,nth,nom,T)
-        # BRAT(t) = union_{s>=t} BRAS(s) = min over j>=i of BRAS[..., j].
-        # Reverse cumulative-min along the (last) time axis realises min_{j>=i},
-        # exactly matching the sequential running-min in reconstruct_brat_6d.
-        brat_px = np.minimum.accumulate(bras[..., ::-1], axis=-1)[..., ::-1]
-        brat_mm[px_idx] = brat_px                                 # contiguous write
-        if (px_idx + 1) % max(1, npx // 10) == 0 or px_idx == npx - 1:
-            print(f"    step {px_idx + 1}/{npx}")
-
-    brat_mm.flush()
-    return brat_mm
-
-
-def save_gap_memmap(v_trans_all, v_rot_all, out_path):
-    """Write |V_trans_6D - V_rot_6D| to an .npy file one time-slice at a time.
-
-    Output shape: (npx, npy, nvx, nvy, nth, nom, T) — T-last, consistent with v_brat_all.
-    Each step computes a 7 GB slice in RAM, accumulates stats, then writes to memmap.
-    Stats are computed from the in-RAM slice so there are no read-backs from disk.
-
-    Args:
-        v_trans_all : (npx, npy, nvx, nvy, T)
-        v_rot_all   : (nth, nom, T)
-        out_path    : destination .npy path (written as memmap)
-
-    Returns:
-        (gap_mm, global_mean, global_max)
-    """
-    T                   = v_trans_all.shape[-1]
-    npx, npy, nvx, nvy  = v_trans_all.shape[:4]
-    nth, nom            = v_rot_all.shape[:2]
-
-    shape   = (npx, npy, nvx, nvy, nth, nom, T)
-    size_gb = int(np.prod(shape)) * 4 / 1e9
-    print(f"  shape={shape}  {size_gb:.1f} GB  → {out_path}")
-
-    gap_mm      = np.lib.format.open_memmap(out_path, mode="w+", dtype=np.float32, shape=shape)
-    running_sum = np.float64(0.0)
-    running_max = np.float32(-np.inf)
-    n_elements  = np.int64(0)
-
-    # Iterate over px (outermost dim) so each gap_mm[px_idx] write is a
-    # contiguous (npy,nvx,nvy,nth,nom,T) block in the T-last C-layout.
-    # Iterating over T instead would scatter writes stride-140 across all 240 GB.
-    for px_idx in range(npx):
-        vt_px  = v_trans_all[px_idx, :, :, :, :].astype(np.float32)  # (npy,nvx,nvy,T)
-        vr_exp = v_rot_all.astype(np.float32)                          # (nth,nom,T)
-        slice_px = np.abs(
-            vt_px[:, :, :, np.newaxis, np.newaxis, :]      # (npy,nvx,nvy,1,1,T)
-            - vr_exp[np.newaxis, np.newaxis, np.newaxis, :, :, :]  # (1,1,1,nth,nom,T)
-        )                                                   # (npy,nvx,nvy,nth,nom,T) ~7 GB
-        running_sum += slice_px.sum(dtype=np.float64)
-        running_max  = max(running_max, float(slice_px.max()))
-        n_elements  += slice_px.size
-        gap_mm[px_idx] = slice_px                          # contiguous write
-        if (px_idx + 1) % max(1, npx // 10) == 0 or px_idx == npx - 1:
-            print(f"    step {px_idx + 1}/{npx}")
-
-    gap_mm.flush()
-    global_mean = float(running_sum / n_elements)
-    global_max  = float(running_max)
-    return gap_mm, global_mean, global_max
-
-
-def compute_close_value_gap(v_trans_all, v_rot_all):
-    """Compute per-grid-point gap |V_trans_6D - V_rot_6D| at every time step.
-
-    For independent subsystems this gap is NOT an approximation error.
-    It indicates which subsystem is the binding constraint at each 6D point
-    and is used in DeepReach as an adaptive guidance weight.
-
-    NOTE: result is (npx,npy,nvx,nvy,nth,nom,T) — 257 GB at paper resolution.
-    Peak RAM during this call is 2× (result + abs temporary). Use save_gap_memmap
-    to stay within memory limits.
-
-    Args:
-        v_trans_all : (npx, npy, nvx, nvy, T)
-        v_rot_all   : (nth, nom, T)
-
-    Returns:
-        (npx, npy, nvx, nvy, nth, nom, T) float32
-    """
-    vt = v_trans_all[:, :, :, :, np.newaxis, np.newaxis, :]   # (npx,npy,nvx,nvy,1,1,T)
-    vr = v_rot_all[np.newaxis, np.newaxis, np.newaxis, np.newaxis, :, :, :]  # (1,1,1,1,nth,nom,T)
-    return np.abs(vt - vr).astype(np.float32)   # (npx,npy,nvx,nvy,nth,nom,T)
-
-
 # ---------------------------------------------------------------------------
 # Main entry points
 # ---------------------------------------------------------------------------
@@ -562,15 +439,6 @@ def main(out_dir: str):
         np.save(p, arr)
         print(f"Saved {fname:30s} shape={str(arr.shape):30s} {arr.nbytes/1e6:.1f} MB  → {p}")
 
-    # -- Reconstruct full 6D BRAT (memmap: only ~15 GB in RAM at any time) --
-    print("\nReconstructing full 6D BRAT  max(V_trans, V_rot)  over time ...")
-    t0 = time.time()
-    brat_path  = os.path.join(out_dir, "v_brat_all.npy")
-    v_brat_all = save_brat_memmap(v_trans_f32, v_rot_f32, brat_path)
-    t_rec = time.time() - t0
-    print(f"  time : {t_rec:.1f}s")
-    print(f"  BRAT  volume at tmax (V<0): {(v_brat_all[0] < 0).mean():.4f}")
-
     # -- Manifest ------------------------------------------------------------
     # Paths are absolute: the manifest is consumed from a different directory
     # than the one holding the arrays (see odp_6d.sh).
@@ -591,21 +459,15 @@ def main(out_dir: str):
                 "axes": ["theta", "omega", "time"],
                 "note": "rotation BRS at each time step (no obstacle, no running-min clamping)",
             },
-            "v_brat_all": {
-                "path": os.path.join(root, "v_brat_all.npy"),
-                "shape": list(v_brat_all.shape),
-                "axes": ["px", "py", "vx", "vy", "theta", "omega", "time"],
-                "note": "full 6D BRAT at each time step; exact reconstruction via max(V_trans, V_rot)",
-            },
         },
         "reconstruction": {
             "method": "Proposition 1 + 4, Chen et al. 2018 (exact for independent subsystems)",
             "formula": "V6D(x,t) = max(V_trans(x[:4],t), V_rot(x[4:],t))",
+            "note": "evaluated on demand by consumers; the full 6D array is never stored",
         },
         "timing": {
             "trans_seconds": round(t_trans, 2),
             "rot_seconds":   round(t_rot,   2),
-            "reconstruct_seconds": round(t_rec, 2),
         },
     }
     manifest_path = os.path.join(out_dir, "artifact_manifest.json")
@@ -620,42 +482,6 @@ def main(out_dir: str):
     print(f"Saved metrics.json            → {metrics_path}")
 
 
-def main_gap_only(out_dir: str):
-    """Recompute close_value_gap_all.npy from already-saved subsystem arrays."""
-    trans_path = os.path.join(out_dir, "v_trans_brs.npy")
-    rot_path   = os.path.join(out_dir, "v_rot_brs.npy")
-    print(f"Loading {trans_path}")
-    v_trans_all = np.load(trans_path)
-    print(f"Loading {rot_path}")
-    v_rot_all   = np.load(rot_path)
-    print(f"  v_trans_brs shape : {v_trans_all.shape}")
-    print(f"  v_rot_brs   shape : {v_rot_all.shape}")
-
-    print("Computing close_value_gap_all (slice-by-slice, memmap) ...")
-    t0 = time.time()
-    gap_path = os.path.join(out_dir, "close_value_gap_all.npy")
-    close_value_gap_all, gap_mean, gap_max = save_gap_memmap(v_trans_all, v_rot_all, gap_path)
-    t_gap = time.time() - t0
-    print(f"  shape : {close_value_gap_all.shape}   time : {t_gap:.1f}s")
-    print(f"  gap   mean={gap_mean:.4f}  max={gap_max:.4f}")
-    print(f"Saved close_value_gap_all.npy  → {gap_path}")
-
-    manifest_path = os.path.join(out_dir, "artifact_manifest.json")
-    if os.path.exists(manifest_path):
-        with open(manifest_path) as f:
-            manifest = json.load(f)
-        manifest.setdefault("values", {})["close_value_gap_all"] = {
-            "path": os.path.abspath(gap_path),
-            "shape": list(close_value_gap_all.shape),
-            "axes": ["px", "py", "vx", "vy", "theta", "omega", "time"],
-            "note": "|V_trans_6D - V_rot_6D|; adaptive guidance weight in DeepReach training",
-        }
-        manifest.setdefault("timing", {})["gap_seconds"] = round(t_gap, 2)
-        with open(manifest_path, "w") as f:
-            json.dump(manifest, f, indent=2)
-        print(f"Updated artifact_manifest.json → {manifest_path}")
-
-
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
         description="Run decomposed SpacecraftDocking6D BRAT solver "
@@ -663,21 +489,12 @@ if __name__ == "__main__":
     )
     parser.add_argument(
         "--out_dir",
-        default="output_SpacecraftDocking6D_decomposed",
-        help="Directory to write outputs "
-             "(default: ./output_SpacecraftDocking6D_decomposed)",
-    )
-    parser.add_argument(
-        "--gap_only",
-        action="store_true",
-        help="Skip the solve; load existing subsystem arrays and recompute gap only.",
+        default=DEFAULT_OUT_DIR,
+        help=f"Directory to write outputs (default: {DEFAULT_OUT_DIR})",
     )
     args = parser.parse_args()
 
-    if args.gap_only:
-        main_gap_only(args.out_dir)
-    else:
-        main(args.out_dir)
+    main(args.out_dir)
 
 
 # ---------------------------------------------------------------------------
@@ -705,212 +522,3 @@ if __name__ == "__main__":
 #     Goal: reach (0, -1.5) m with theta_g = pi/2 within paper tolerances.
 #
 #     Reference: Thorup et al., arXiv:2605.02021, 2026.
-#     """
-#
-#     def __init__(self, n: float = 0.001131, m: float = 200.0, I: float = 200/6):
-#         super().__init__(
-#             loss_type='brat_hjivi',
-#             set_mode='reach',
-#             state_dim=6,
-#             input_dim=7,
-#             control_dim=3,
-#             disturbance_dim=0,
-#             state_mean=[0.0, 0.0, 0.0, 0.0, math.pi / 2, 0.0],
-#             state_var=[20.0, 20.0, 5.0, 5.0, math.pi, 2.0],
-#             value_mean=0.0,
-#             value_var=1.0,
-#             value_normto=0.02,
-#             deepreach_model="exact",
-#         )
-#         self.n = n
-#         self.m = m
-#         self.I = I
-#
-#         # Control bounds (paper values)
-#         self.Fmax    = 20.0   # [N]
-#         self.tau_max = 1.5    # [N*m]
-#
-#         # Goal tolerances (paper values)
-#         self.eps_p  = 0.1    # position [m]
-#         self.eps_v  = 0.1    # velocity [m/s]
-#         self.eps_th = 0.04   # attitude [rad]
-#         self.eps_w  = 0.05   # angular rate [rad/s]
-#
-#         self.theta_goal = math.pi / 2
-#
-#         # Chaser bounding-circle radius (paper: rc ≈ 0.707 m)
-#         self.rc = 0.707
-#
-#         # Target body: 6×3 m, y ∈ [0, 3], x ∈ [-3, 3]
-#         self.w_t = 6.0
-#         self.h_t = 3.0
-#
-#         # Docking post: extends below body, y ∈ [-0.2, 0], x ∈ [-0.6, 0.6]
-#         self.post_hw_x    = 0.6
-#         self.post_length  = 0.2
-#
-#         # Goal band: just below inflated post, with clearance
-#         self.goal_y_max = -(self.post_length + self.rc + 0.093)  # ≈ -1.0
-#         self.goal_y_min = self.goal_y_max - 0.4                  # ≈ -1.4
-#
-#     # ------------------------------------------------------------------
-#     # Required interface
-#     # ------------------------------------------------------------------
-#
-#     def state_test_range(self):
-#         return [
-#             [-15.0, 15.0],               # px [m]
-#             [-15.0, 15.0],               # py [m]
-#             [-1.5,   1.5],               # vx [m/s]
-#             [-1.5,   1.5],               # vy [m/s]
-#             [-math.pi, math.pi],         # theta [rad]
-#             [-2.0,   2.0],               # omega [rad/s]
-#         ]
-#
-#     def equivalent_wrapped_state(self, state):
-#         wrapped = torch.clone(state)
-#         wrapped[..., 4] = (wrapped[..., 4] + math.pi) % (2 * math.pi) - math.pi
-#         return wrapped
-#
-#     def dsdt(self, state, control, disturbance):
-#         dsdt = torch.zeros_like(state)
-#         n = self.n
-#         dsdt[..., 0] = state[..., 2]
-#         dsdt[..., 1] = state[..., 3]
-#         dsdt[..., 2] = 3.0*n**2*state[..., 0] + 2.0*n*state[..., 3] + control[..., 0] / self.m
-#         dsdt[..., 3] = -2.0*n*state[..., 2]                           + control[..., 1] / self.m
-#         dsdt[..., 4] = state[..., 5]
-#         dsdt[..., 5] = control[..., 2] / self.I
-#         return dsdt
-#
-#     def reach_fn(self, state):
-#         """g(x) ≤ 0 iff in docking goal set. Matches reference Docking6D formulation."""
-#         px, py     = state[..., 0], state[..., 1]
-#         vx, vy     = state[..., 2], state[..., 3]
-#         theta, omega = state[..., 4], state[..., 5]
-#
-#         # Position: x near port axis + y inside goal band
-#         x_dist  = torch.abs(px) - self.eps_p
-#         y_lo    = torch.tensor(self.goal_y_min, device=state.device, dtype=state.dtype)
-#         y_hi    = torch.tensor(self.goal_y_max, device=state.device, dtype=state.dtype)
-#         y_dist  = torch.maximum(y_lo - py, py - y_hi)
-#         pos_dist = torch.maximum(x_dist, y_dist)
-#
-#         # Velocity: L2 norm
-#         vel_dist = torch.sqrt(vx**2 + vy**2 + 1e-8) - self.eps_v
-#
-#         # Attitude: wrapped angle error
-#         theta_dist = torch.abs(torch.atan2(
-#             torch.sin(theta - self.theta_goal),
-#             torch.cos(theta - self.theta_goal)
-#         )) - self.eps_th
-#
-#         # Angular rate
-#         rate_dist = torch.abs(omega) - self.eps_w
-#
-#         # Tanh outside goal (bounds gradients), amplified inside
-#         pos_dist   = torch.where(pos_dist   < 0, pos_dist   * 20,  torch.tanh(pos_dist   * 0.5))
-#         vel_dist   = torch.where(vel_dist   < 0, vel_dist   * 20,  torch.tanh(vel_dist   * 1.0))
-#         theta_dist = torch.where(theta_dist < 0, theta_dist * 150, torch.tanh(theta_dist * 1.0))
-#         rate_dist  = torch.where(rate_dist  < 0, rate_dist  * 30,  torch.tanh(rate_dist  * 1.0))
-#
-#         return torch.max(
-#             torch.stack([pos_dist, vel_dist, theta_dist, rate_dist], dim=-1), dim=-1
-#         ).values * 1.2
-#
-#     def avoid_fn(self, state):
-#         """ℓ(x): positive = safe, negative = inside obstacle (body or post, inflated by rc).
-#
-#         Uses per-axis inflation matching the reference implementation.
-#         """
-#         px, py = state[..., 0], state[..., 1]
-#         cb = self.rc
-#
-#         # Body: y ∈ [0, h_t], x ∈ [-w_t/2, w_t/2], inflated by cb
-#         s_body = torch.maximum(
-#             torch.abs(px) - (self.w_t / 2.0 + cb),
-#             torch.maximum(-(py + cb), py - (self.h_t + cb)),
-#         )
-#
-#         # Post: y ∈ [-post_length, 0], x ∈ [-post_hw_x, post_hw_x], inflated by cb
-#         s_post = torch.maximum(
-#             torch.abs(px) - (self.post_hw_x + cb),
-#             torch.maximum(-(py + self.post_length + cb), py - cb),
-#         )
-#
-#         s_fail = torch.minimum(s_body, s_post)
-#         return torch.where(s_fail < 0, s_fail * 1.5, s_fail)
-#
-#     def boundary_fn(self, state):
-#         """≤ 0 iff in goal set AND outside both obstacles (BRAT terminal condition)."""
-#         return torch.maximum(self.reach_fn(state), -self.avoid_fn(state))
-#
-#     def hamiltonian(self, state, dvds):
-#         """H(x, p) = p·f_drift(x) + min_u p·B·u  (reach: min over u)."""
-#         n = self.n
-#         ham_drift = (
-#             dvds[..., 0] * state[..., 2] +
-#             dvds[..., 1] * state[..., 3] +
-#             dvds[..., 2] * (3.0*n**2*state[..., 0] + 2.0*n*state[..., 3]) +
-#             dvds[..., 3] * (-2.0*n*state[..., 2]) +
-#             dvds[..., 4] * state[..., 5]
-#         )
-#         # Bang-bang minimisation: min_{|u_i|≤ū_i} p_i * u_i = -ū_i * |p_i|
-#         ham_ctrl = (
-#             -self.Fmax    / self.m * torch.abs(dvds[..., 2]) +
-#             -self.Fmax    / self.m * torch.abs(dvds[..., 3]) +
-#             -self.tau_max / self.I * torch.abs(dvds[..., 5])
-#         )
-#         return ham_drift + ham_ctrl
-#
-#     def optimal_control(self, state, dvds):
-#         """u* = -ū·sign(B^T p), where B^T p = [p2/m, p3/m, p5/I]."""
-#         opt_Fx  = -self.Fmax    * torch.sign(dvds[..., 2])
-#         opt_Fy  = -self.Fmax    * torch.sign(dvds[..., 3])
-#         opt_tau = -self.tau_max * torch.sign(dvds[..., 5])
-#         return torch.stack([opt_Fx, opt_Fy, opt_tau], dim=-1)
-#
-#     def optimal_disturbance(self, state, dvds):
-#         return 0
-#
-#     def sample_target_state(self, num_samples):
-#         """Uniform sample inside the docking goal set (all six tolerances satisfied)."""
-#         lo = torch.tensor([
-#             -self.eps_p,
-#             self.goal_y_min,
-#             -self.eps_v,
-#             -self.eps_v,
-#             self.theta_goal - self.eps_th,
-#             -self.eps_w,
-#         ])
-#         hi = torch.tensor([
-#             self.eps_p,
-#             self.goal_y_max,
-#             self.eps_v,
-#             self.eps_v,
-#             self.theta_goal + self.eps_th,
-#             self.eps_w,
-#         ])
-#         return lo + torch.rand(num_samples, self.state_dim) * (hi - lo)
-#
-#     def cost_fn(self, state_traj):
-#         """BRAT trajectory cost: min_t max(g(x(t)), max_{k<=t} -ℓ(x(k)))."""
-#         reach_values = self.reach_fn(state_traj)
-#         avoid_values = self.avoid_fn(state_traj)
-#         return torch.min(
-#             torch.maximum(reach_values, torch.cummax(-avoid_values, dim=-1).values),
-#             dim=-1,
-#         ).values
-#
-#     def periodic_state_dims(self):
-#         return (4,)  # theta is periodic
-#
-#     def plot_config(self):
-#         return {
-#             'state_slices': [0.0, -1.5, 0.0, 0.0, math.pi / 2, 0.0],
-#             'state_labels': [r'$p_x$', r'$p_y$', r'$v_x$', r'$v_y$',
-#                              r'$\theta$', r'$\omega$'],
-#             'x_axis_idx': 0,
-#             'y_axis_idx': 1,
-#             'z_axis_idx': 2,
-#         }
